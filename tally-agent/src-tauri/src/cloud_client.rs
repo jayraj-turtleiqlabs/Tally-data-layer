@@ -17,39 +17,73 @@ pub struct PairRequest {
     pub code: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct PairResponse {
-    #[serde(default, alias = "agentToken", alias = "agent_token", alias = "token")]
+    pub token: Option<String>,
     pub agent_token: Option<String>,
-    #[serde(default, alias = "connectionId", alias = "connection_id", alias = "id")]
+    pub agentToken: Option<String>,
     pub connection_id: Option<String>,
-    #[serde(default, alias = "companyName", alias = "company_name", alias = "name")]
+    pub connectionId: Option<String>,
+    pub organization_id: Option<String>,
+    pub organizationId: Option<String>,
     pub company_name: Option<String>,
-    #[serde(default)]
-    pub data: Option<PairResponseData>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PairResponseData {
-    #[serde(default, alias = "agentToken", alias = "agent_token", alias = "token")]
-    pub agent_token: Option<String>,
-    #[serde(default, alias = "connectionId", alias = "connection_id", alias = "id")]
-    pub connection_id: Option<String>,
-    #[serde(default, alias = "companyName", alias = "company_name", alias = "name")]
-    pub company_name: Option<String>,
+    pub companyName: Option<String>,
+    pub data: Option<serde_json::Value>,
 }
 
 impl PairResponse {
     pub fn token(&self) -> Result<String, ApiError> {
-        if let Some(ref t) = self.agent_token {
-            return Ok(t.clone());
-        }
-        if let Some(ref d) = self.data {
-            if let Some(ref t) = d.agent_token {
+        if let Some(ref t) = self.token {
+            if !t.is_empty() {
                 return Ok(t.clone());
             }
         }
+        if let Some(ref t) = self.agent_token {
+            if !t.is_empty() {
+                return Ok(t.clone());
+            }
+        }
+        if let Some(ref t) = self.agentToken {
+            if !t.is_empty() {
+                return Ok(t.clone());
+            }
+        }
+        if let Some(ref d) = self.data {
+            if let Some(t) = d.get("token").or_else(|| d.get("agent_token")).or_else(|| d.get("agentToken")) {
+                if let Some(s) = t.as_str() {
+                    if !s.is_empty() {
+                        return Ok(s.to_string());
+                    }
+                }
+            }
+        }
         Err(ApiError::InvalidResponse("No token field in pairing response".to_string()))
+    }
+
+    pub fn connection_id(&self) -> Option<String> {
+        self.connection_id
+            .clone()
+            .or_else(|| self.connectionId.clone())
+            .or_else(|| {
+                self.data.as_ref().and_then(|d| {
+                    d.get("connection_id")
+                        .or_else(|| d.get("connectionId"))
+                        .and_then(|v| v.as_str().map(String::from))
+                })
+            })
+    }
+
+    pub fn company_name(&self) -> Option<String> {
+        self.company_name
+            .clone()
+            .or_else(|| self.companyName.clone())
+            .or_else(|| {
+                self.data.as_ref().and_then(|d| {
+                    d.get("company_name")
+                        .or_else(|| d.get("companyName"))
+                        .and_then(|v| v.as_str().map(String::from))
+                })
+            })
     }
 }
 
@@ -81,11 +115,16 @@ pub struct HeartbeatPayload {
     pub last_known_alter_id: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct HeartbeatResponse {
-    /// Dashboard may set this flag for the agent to poll — optional piggyback.
-    #[serde(default, alias = "syncRequested", alias = "sync_requested")]
-    pub sync_requested: bool,
+    pub sync_requested: Option<bool>,
+    pub syncRequested: Option<bool>,
+}
+
+impl HeartbeatResponse {
+    pub fn is_sync_requested(&self) -> bool {
+        self.sync_requested.unwrap_or(false) || self.syncRequested.unwrap_or(false)
+    }
 }
 
 pub struct CloudClient {

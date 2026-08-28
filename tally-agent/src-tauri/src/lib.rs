@@ -314,7 +314,7 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
 
             if let Ok(resp) = cloud.heartbeat(&payload).await {
                 // Dashboard-triggered sync: poll flag piggybacked on heartbeat
-                if resp.sync_requested && !state.orchestrator.lock().await.as_ref().map(|o| o.is_sync_in_progress()).unwrap_or(false) {
+                if resp.is_sync_requested() && !state.orchestrator.lock().await.as_ref().map(|o| o.is_sync_in_progress()).unwrap_or(false) {
                     log::info!("Dashboard requested sync via heartbeat poll flag");
                     match state.sync_now().await {
                         Ok(res) => {
