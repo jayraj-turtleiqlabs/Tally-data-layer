@@ -50,7 +50,10 @@ impl AgentState {
     pub fn new(tally_port: u16) -> Result<Self, AgentError> {
         let endpoint = TallyEndpoint::new("127.0.0.1", tally_port)?;
         let tally = TallyClient::new(endpoint)?;
-        let cloud = CloudClient::new()?;
+        let mut cloud = CloudClient::new()?;
+        if let Ok(token) = Vault::get_token() {
+            cloud = cloud.with_token(&token);
+        }
         let checkpoint_store = CheckpointStore::new(CheckpointStore::default_path());
         let checkpoint = checkpoint_store.load()?;
 
@@ -134,7 +137,8 @@ impl AgentState {
         };
 
         println!("[pair] Step 5: Storing agent token in vault...");
-        Vault::store_token(&response.agent_token)?;
+        let token = response.token()?;
+        Vault::store_token(&token)?;
         println!("[pair] Step 5 OK: Token stored");
 
         {
@@ -148,7 +152,7 @@ impl AgentState {
         {
             let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
             let tally = TallyClient::new(endpoint)?;
-            let cloud = CloudClient::new()?;
+            let cloud = CloudClient::new()?.with_token(&token);
             let mut orch = self.orchestrator.lock().await;
             *orch = Some(SyncOrchestrator::new(
                 tally,
@@ -293,8 +297,12 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
             }
 
             let checkpoint = state.checkpoint_store.load().unwrap_or_default();
+            let token = match Vault::get_token() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             let cloud = match CloudClient::new() {
-                Ok(c) => c,
+                Ok(c) => c.with_token(&token),
                 Err(_) => continue,
             };
 

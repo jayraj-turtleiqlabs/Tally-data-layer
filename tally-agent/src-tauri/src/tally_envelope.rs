@@ -30,53 +30,43 @@ pub struct ExportEnvelope {
 
 impl ExportEnvelope {
     pub fn build(report: ExportReport, alter_id_from: Option<u64>) -> Self {
-        let id = match report {
-            ExportReport::CompanyInfo => "Company Info",
-            ExportReport::Ledgers => "List of Ledgers",
-            ExportReport::Groups => "List of Groups",
-            ExportReport::Vouchers => "Voucher Register",
-            ExportReport::DeltaCollection => "AlterIds",
+        let (collection_name, entity_type, fetch_fields) = match report {
+            ExportReport::CompanyInfo => ("Collection of Companies", "Company", "NAME, ALTERID"),
+            ExportReport::Ledgers => ("Ledgers", "Ledger", "NAME, PARENT, ALTERID, OPENINGBALANCE"),
+            ExportReport::Groups => ("Groups", "Group", "NAME, PARENT, ALTERID"),
+            ExportReport::Vouchers => ("Vouchers", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT"),
+            ExportReport::DeltaCollection => ("AlterIds", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT"),
         };
 
-        let alter_filter = alter_id_from.map(|id| {
+        let filter_block = alter_id_from.map(|id| {
             format!(
                 r#"
-        <FILTERS>AlterIdFilter</FILTERS>
-        <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterID &gt; {id}</SYSTEM>"#
+          <FILTERS>AlterIdFilter</FILTERS>
+          <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterID &gt; {id}</SYSTEM>"#
             )
         }).unwrap_or_default();
-
-        let collection_block = if report == ExportReport::DeltaCollection {
-            format!(
-                r#"
-      <TDL>
-        <TDLMESSAGE>
-          <COLLECTION NAME="AlterIds" ISMODIFY="No">
-            <TYPE>Voucher</TYPE>
-            <FILTERS>AlterIdFilter</FILTERS>
-          </COLLECTION>
-          <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterID &gt; {}</SYSTEM>
-        </TDLMESSAGE>
-      </TDL>"#,
-                alter_id_from.unwrap_or(0)
-            )
-        } else {
-            alter_filter
-        };
 
         let xml = format!(
             r#"<ENVELOPE>
   <HEADER>
     <VERSION>1</VERSION>
     <TALLYREQUEST>Export</TALLYREQUEST>
-    <TYPE>Data</TYPE>
-    <ID>{id}</ID>
+    <TYPE>Collection</TYPE>
+    <ID>{collection_name}</ID>
   </HEADER>
   <BODY>
     <DESC>
       <STATICVARIABLES>
         <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-      </STATICVARIABLES>{collection_block}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="{collection_name}" ISMODIFY="No">
+            <TYPE>{entity_type}</TYPE>
+            <FETCH>{fetch_fields}</FETCH>{filter_block}
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
     </DESC>
   </BODY>
 </ENVELOPE>"#
@@ -90,6 +80,7 @@ impl ExportEnvelope {
     }
 
     /// Ping/status envelope — still Export, never Import.
+    /// Uses TDL Collection query compatible with both TallyPrime and ERP 9.
     pub fn ping() -> Self {
         Self::build(ExportReport::CompanyInfo, None)
     }

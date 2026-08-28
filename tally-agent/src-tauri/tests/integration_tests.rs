@@ -24,7 +24,7 @@ fn request_builder_has_no_import_variant() {
 async fn backend_non_200_leaves_checkpoint_unchanged() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/v1/sync/delta"))
+        .and(path("/api/v1/agent/sync/delta"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -123,7 +123,7 @@ async fn retry_after_failure_sync_orchestrator() {
     }
 
     Mock::given(method("POST"))
-        .and(path("/api/v1/sync/delta"))
+        .and(path("/api/v1/agent/sync/delta"))
         .respond_with(FailThenSucceed {
             count: std::sync::atomic::AtomicUsize::new(0),
         })

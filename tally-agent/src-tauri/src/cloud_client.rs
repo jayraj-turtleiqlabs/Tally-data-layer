@@ -19,12 +19,38 @@ pub struct PairRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PairResponse {
-    #[serde(alias = "agentToken", alias = "agent_token")]
-    pub agent_token: String,
-    #[serde(default, alias = "connectionId", alias = "connection_id")]
+    #[serde(default, alias = "agentToken", alias = "agent_token", alias = "token")]
+    pub agent_token: Option<String>,
+    #[serde(default, alias = "connectionId", alias = "connection_id", alias = "id")]
     pub connection_id: Option<String>,
-    #[serde(default, alias = "companyName", alias = "company_name")]
+    #[serde(default, alias = "companyName", alias = "company_name", alias = "name")]
     pub company_name: Option<String>,
+    #[serde(default)]
+    pub data: Option<PairResponseData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairResponseData {
+    #[serde(default, alias = "agentToken", alias = "agent_token", alias = "token")]
+    pub agent_token: Option<String>,
+    #[serde(default, alias = "connectionId", alias = "connection_id", alias = "id")]
+    pub connection_id: Option<String>,
+    #[serde(default, alias = "companyName", alias = "company_name", alias = "name")]
+    pub company_name: Option<String>,
+}
+
+impl PairResponse {
+    pub fn token(&self) -> Result<String, ApiError> {
+        if let Some(ref t) = self.agent_token {
+            return Ok(t.clone());
+        }
+        if let Some(ref d) = self.data {
+            if let Some(ref t) = d.agent_token {
+                return Ok(t.clone());
+            }
+        }
+        Err(ApiError::InvalidResponse("No token field in pairing response".to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,48 +157,67 @@ impl CloudClient {
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
-        if !resp.status().is_success() {
-            log::warn!("Pairing failed with status {}", resp.status());
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        println!("[cloud_client] Pair response HTTP {}, body: {}", status, text);
+
+        if !status.is_success() {
+            log::warn!("Pairing failed with status {}: {}", status, text);
             return Err(ApiError::PairingFailed);
         }
 
-        resp.json::<PairResponse>()
-            .await
-            .map_err(|e| ApiError::InvalidResponse(redact(&e.to_string())))
+        serde_json::from_str::<PairResponse>(&text).map_err(|e| {
+            println!("[cloud_client] Deserialization error: {} for text: {}", e, text);
+            ApiError::InvalidResponse(redact(&e.to_string()))
+        })
     }
 
-    /// POST /api/v1/sync/initial — bearer auth, one-way push.
+    /// POST /api/v1/agent/sync/delta — bearer auth, one-way push for initial batches.
     pub async fn push_initial_batch(&self, batch: &SyncBatchPayload) -> Result<(), ApiError> {
         let token = self.bearer_token().await?;
         let resp = self
             .http
-            .post(self.url("/api/v1/sync/initial"))
+            .post(self.url("/api/v1/agent/sync/delta"))
             .bearer_auth(&token)
             .json(batch)
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
-        if resp.status().as_u16() != 200 {
-            return Err(ApiError::SyncFailed(resp.status().as_u16()));
+        let status = resp.status();
+        println!("[cloud_client] Initial batch {}/{} response HTTP {}", batch.batch_index + 1, batch.total_batches, status);
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            println!("[cloud_client] Initial batch failed body: {}", body);
+            return Err(ApiError::SyncFailed(status.as_u16()));
         }
         Ok(())
     }
 
-    /// POST /api/v1/sync/delta — bearer auth, one-way push.
+    /// POST /api/v1/agent/sync/delta — bearer auth, one-way push.
     pub async fn push_delta(&self, payload: &DeltaSyncPayload) -> Result<(), ApiError> {
         let token = self.bearer_token().await?;
         let resp = self
             .http
-            .post(self.url("/api/v1/sync/delta"))
+            .post(self.url("/api/v1/agent/sync/delta"))
             .bearer_auth(&token)
             .json(payload)
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
-        if resp.status().as_u16() != 200 {
-            return Err(ApiError::SyncFailed(resp.status().as_u16()));
+        let status = resp.status();
+        println!("[cloud_client] Delta sync response HTTP {}", status);
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            println!("[cloud_client] Delta sync failed body: {}", body);
+            return Err(ApiError::SyncFailed(status.as_u16()));
         }
         Ok(())
     }
