@@ -104,8 +104,9 @@ pairBtn.addEventListener("click", async () => {
     companyName.textContent = company;
     pairingCodeInput.value = "";
     await refreshStatus();
-  } catch {
-    pairError.textContent = "Pairing failed. Please check your code and try again.";
+  } catch (e) {
+    pairError.textContent =
+      typeof e === "string" ? e : "Pairing failed. Please check your code and try again.";
     pairError.classList.remove("hidden");
   } finally {
     pairBtn.disabled = false;

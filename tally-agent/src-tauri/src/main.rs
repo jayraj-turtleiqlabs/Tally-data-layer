@@ -31,7 +31,11 @@ async fn pair_agent(
     state
         .pair(&code)
         .await
-        .map_err(|_| "Pairing failed. Please check your code and try again.".to_string())
+        .map_err(|e| {
+            let msg = format!("{}", e);
+            println!("[pair_agent] Error: {}", msg);
+            msg
+        })
 }
 
 #[tauri::command]

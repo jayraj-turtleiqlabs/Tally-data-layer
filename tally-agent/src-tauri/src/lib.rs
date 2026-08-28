@@ -102,17 +102,40 @@ impl AgentState {
     }
 
     pub async fn pair(&self, code: &str) -> Result<String, AgentError> {
+        println!("[pair] Step 1: Creating TallyEndpoint on 127.0.0.1:{}", self.tally_port);
         let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
         let tally = TallyClient::new(endpoint)?;
-        let company = tally.ping().await?;
 
+        println!("[pair] Step 2: Pinging local Tally...");
+        let company = match tally.ping().await {
+            Ok(c) => {
+                println!("[pair] Step 2 OK: Tally responded, company='{}'", c.company_name);
+                c
+            }
+            Err(e) => {
+                println!("[pair] Step 2 FAILED: Tally ping error: {:?}", e);
+                return Err(e.into());
+            }
+        };
+
+        println!("[pair] Step 3: Creating CloudClient...");
         let cloud = CloudClient::new()?;
-        let response = cloud
-            .pair(code, &company.company_name)
-            .await
-            .map_err(|_| AgentError::Api(crate::errors::ApiError::PairingFailed))?;
 
+        println!("[pair] Step 4: Sending pair request to cloud with code='{}'", &code[..code.len().min(4)]);
+        let response = match cloud.pair(code, &company.company_name).await {
+            Ok(r) => {
+                println!("[pair] Step 4 OK: Pairing succeeded, got agent_token");
+                r
+            }
+            Err(e) => {
+                println!("[pair] Step 4 FAILED: Cloud pair error: {:?}", e);
+                return Err(AgentError::Api(crate::errors::ApiError::PairingFailed));
+            }
+        };
+
+        println!("[pair] Step 5: Storing agent token in vault...");
         Vault::store_token(&response.agent_token)?;
+        println!("[pair] Step 5 OK: Token stored");
 
         {
             let mut status = self.status.write().await;
@@ -134,8 +157,10 @@ impl AgentState {
             ));
         }
 
+        println!("[pair] Step 6: Running initial backfill...");
         // Automatic initial backfill after pairing
         self.run_backfill_internal().await?;
+        println!("[pair] Step 6 OK: Backfill complete");
 
         Ok(company.company_name)
     }
