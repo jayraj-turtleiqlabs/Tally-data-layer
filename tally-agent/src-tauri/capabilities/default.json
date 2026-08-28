@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for FinInsight Tally Agent",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:tray:default",
+    "core:menu:default",
+    "core:window:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus"
+  ]
+}

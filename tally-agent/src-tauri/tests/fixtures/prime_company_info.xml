@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYPRIME>1</TALLYPRIME>
+    <STATUS>1</STATUS>
+  </HEADER>
+  <BODY>
+    <DATA>
+      <COLLECTION>
+        <COMPANY NAME="Prime Corp Ltd">
+          <ALTERID>9102</ALTERID>
+        </COMPANY>
+      </COLLECTION>
+    </DATA>
+  </BODY>
+</ENVELOPE>

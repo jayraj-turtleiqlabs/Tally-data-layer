@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FinInsight Tally Agent</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>FinInsight Tally Agent</h1>
+        <p id="connection-badge" class="badge badge-idle">Checking…</p>
+      </header>
+
+      <section id="pair-section" class="card hidden">
+        <h2>Pair with FinInsight</h2>
+        <p class="hint">Enter the 8-character code from your FinInsight dashboard.</p>
+        <input
+          id="pairing-code"
+          type="text"
+          maxlength="8"
+          placeholder="ABCD1234"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="pair-btn" class="btn primary">Pair</button>
+        <p id="pair-error" class="error hidden"></p>
+      </section>
+
+      <section id="paired-section" class="card hidden">
+        <h2 id="company-name">—</h2>
+        <dl class="status-grid">
+          <dt>Tally</dt>
+          <dd id="tally-status">—</dd>
+          <dt>Last sync</dt>
+          <dd id="last-sync">Never</dd>
+          <dt>Checkpoint</dt>
+          <dd id="alter-id">—</dd>
+        </dl>
+        <p id="sync-error" class="error hidden"></p>
+        <button id="sync-btn" class="btn primary large">Sync Now</button>
+        <button id="disconnect-btn" class="btn secondary">Disconnect / Re-pair</button>
+      </section>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

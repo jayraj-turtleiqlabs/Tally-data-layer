@@ -1,0 +1,19 @@
+node_modules/
+dist/
+target/
+*.log
+.env
+.env.*
+!.env.example
+
+# Tauri
+tally-agent/src-tauri/target/
+tally-agent/src-tauri/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

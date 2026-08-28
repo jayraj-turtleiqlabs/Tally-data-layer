@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ENVELOPE>
+  <BODY>
+    <DATA>
+      <COLLECTION>
+        <LEDGER NAME="Cash">
+          <PARENT>Current Assets</PARENT>
+          <ALTERID>100</ALTERID>
+          <OPENINGBALANCE>50000.00</OPENINGBALANCE>
+        </LEDGER>
+        <LEDGER NAME="Sales">
+          <PARENT>Direct Incomes</PARENT>
+          <ALTERID>101</ALTERID>
+          <OPENINGBALANCE>0</OPENINGBALANCE>
+        </LEDGER>
+      </COLLECTION>
+    </DATA>
+  </BODY>
+</ENVELOPE>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <STATUS>1</STATUS>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <CMPINFO>
+        <COMPANYNAME>Acme Traders</COMPANYNAME>
+        <ALTERID>4821</ALTERID>
+      </CMPINFO>
+    </DESC>
+    <DATA>
+      <COLLECTION>
+        <COMPANY NAME="Acme Traders">
+          <ALTERID>4821</ALTERID>
+        </COMPANY>
+      </COLLECTION>
+    </DATA>
+  </BODY>
+</ENVELOPE>

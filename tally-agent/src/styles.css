@@ -1,0 +1,154 @@
+:root {
+  --bg: #0f1419;
+  --surface: #1a2332;
+  --border: #2d3a4f;
+  --text: #e7ecf3;
+  --muted: #8b9cb3;
+  --primary: #3b82f6;
+  --primary-hover: #2563eb;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+  --radius: 10px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+#app {
+  padding: 24px;
+  max-width: 420px;
+  margin: 0 auto;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+header h1 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.badge {
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+.badge-idle { background: var(--border); color: var(--muted); }
+.badge-paired { background: #14532d; color: var(--success); }
+.badge-unpaired { background: #451a03; color: var(--warning); }
+.badge-syncing { background: #1e3a5f; color: var(--primary); }
+.badge-error { background: #450a0a; color: var(--error); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.card.hidden { display: none; }
+
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.875rem;
+  margin: 0 0 16px;
+}
+
+input[type="text"] {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 1.25rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  text-align: center;
+  margin-bottom: 12px;
+}
+
+.btn {
+  width: 100%;
+  padding: 12px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn.primary {
+  background: var(--primary);
+  color: white;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.btn.primary.large {
+  padding: 16px;
+  font-size: 1.05rem;
+  margin-bottom: 10px;
+}
+
+.btn.secondary {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 16px;
+  margin: 16px 0 20px;
+  font-size: 0.875rem;
+}
+
+.status-grid dt {
+  color: var(--muted);
+  margin: 0;
+}
+
+.status-grid dd {
+  margin: 0;
+  text-align: right;
+}
+
+.error {
+  color: var(--error);
+  font-size: 0.875rem;
+  margin: 8px 0 0;
+}
+
+.error.hidden { display: none; }

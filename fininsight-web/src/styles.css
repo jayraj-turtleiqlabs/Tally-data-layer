@@ -1,0 +1,158 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.login-card {
+  background: white;
+  padding: 2rem;
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.login-card h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.subtitle {
+  color: #64748b;
+  margin: 0 0 1rem;
+}
+
+.login-card input {
+  padding: 0.75rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 1rem;
+}
+
+.login-card button {
+  margin-top: 0.5rem;
+  padding: 0.75rem;
+  background: #2563eb;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.error {
+  color: #dc2626;
+  font-size: 0.875rem;
+}
+
+.dashboard-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1.5rem 2rem;
+  background: white;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.header-actions {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.dashboard-main {
+  padding: 2rem;
+  display: grid;
+  gap: 1.5rem;
+  max-width: 900px;
+}
+
+.panel {
+  background: white;
+  padding: 1.5rem;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+}
+
+.panel h2 {
+  margin-top: 0;
+}
+
+.pairing-code-display .code {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  font-family: monospace;
+}
+
+.member-list {
+  list-style: none;
+  padding: 0;
+}
+
+.member-list li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.role-badge {
+  background: #e2e8f0;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+}
+
+.invite-form {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+button.secondary {
+  background: transparent;
+  border: 1px solid #e2e8f0;
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.loading {
+  padding: 2rem;
+  text-align: center;
+}
+
+.connection-switcher select {
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+}
+
+.hint {
+  color: #64748b;
+  font-size: 0.875rem;
+}
+
+.user-info {
+  color: #64748b;
+  font-size: 0.875rem;
+  margin: 0.25rem 0 0;
+}
