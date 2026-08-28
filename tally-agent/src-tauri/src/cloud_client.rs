@@ -18,6 +18,7 @@ pub struct PairRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[allow(non_snake_case)]
 pub struct PairResponse {
     pub token: Option<String>,
     pub agent_token: Option<String>,
@@ -116,6 +117,7 @@ pub struct HeartbeatPayload {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[allow(non_snake_case)]
 pub struct HeartbeatResponse {
     pub sync_requested: Option<bool>,
     pub syncRequested: Option<bool>,
