@@ -14,14 +14,17 @@ pub fn api_base_url() -> &'static str {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PairRequest {
-    pub pairing_code: String,
-    pub tally_company_name: String,
+    pub code: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PairResponse {
+    #[serde(alias = "agent_token")]
     pub agent_token: String,
+    #[serde(alias = "company_name")]
     pub company_name: String,
+    #[serde(alias = "connection_id")]
     pub connection_id: String,
 }
 
@@ -54,8 +57,10 @@ pub struct HeartbeatPayload {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HeartbeatResponse {
     /// Dashboard may set this flag for the agent to poll — optional piggyback.
+    #[serde(alias = "sync_requested")]
     pub sync_requested: bool,
 }
 
@@ -67,12 +72,15 @@ pub struct CloudClient {
 
 impl CloudClient {
     pub fn new() -> Result<Self, ApiError> {
+        let base = api_base_url();
+        println!("=== FinInsight Agent using API base: {} ===", base);
+        log::info!("FinInsight Agent using API base: {}", base);
         let http = Client::builder()
             .build()
             .map_err(|e| ApiError::Network(e.to_string()))?;
         Ok(Self {
             http,
-            base_url: api_base_url().trim_end_matches('/').to_string(),
+            base_url: base.trim_end_matches('/').to_string(),
             bearer_token: None,
         })
     }
@@ -110,10 +118,9 @@ impl CloudClient {
     }
 
     /// POST /api/v1/agent/pair — no auth required.
-    pub async fn pair(&self, code: &str, tally_company: &str) -> Result<PairResponse, ApiError> {
+    pub async fn pair(&self, code: &str, _tally_company: &str) -> Result<PairResponse, ApiError> {
         let body = PairRequest {
-            pairing_code: code.to_uppercase(),
-            tally_company_name: tally_company.to_string(),
+            code: code.to_uppercase(),
         };
 
         log::info!("Pairing attempt initiated");
