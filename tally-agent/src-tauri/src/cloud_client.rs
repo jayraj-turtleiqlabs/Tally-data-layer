@@ -18,14 +18,13 @@ pub struct PairRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PairResponse {
-    #[serde(alias = "agent_token")]
+    #[serde(alias = "agentToken", alias = "agent_token")]
     pub agent_token: String,
-    #[serde(alias = "company_name")]
-    pub company_name: String,
-    #[serde(alias = "connection_id")]
-    pub connection_id: String,
+    #[serde(default, alias = "connectionId", alias = "connection_id")]
+    pub connection_id: Option<String>,
+    #[serde(default, alias = "companyName", alias = "company_name")]
+    pub company_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,10 +56,9 @@ pub struct HeartbeatPayload {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HeartbeatResponse {
     /// Dashboard may set this flag for the agent to poll — optional piggyback.
-    #[serde(alias = "sync_requested")]
+    #[serde(default, alias = "syncRequested", alias = "sync_requested")]
     pub sync_requested: bool,
 }
 

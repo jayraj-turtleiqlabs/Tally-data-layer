@@ -117,7 +117,7 @@ impl AgentState {
         {
             let mut status = self.status.write().await;
             status.paired = true;
-            status.company_name = Some(response.company_name.clone());
+            status.company_name = Some(company.company_name.clone());
             status.last_error = None;
         }
 
@@ -137,7 +137,7 @@ impl AgentState {
         // Automatic initial backfill after pairing
         self.run_backfill_internal().await?;
 
-        Ok(response.company_name)
+        Ok(company.company_name)
     }
 
     pub async fn disconnect(&self) -> Result<(), AgentError> {
