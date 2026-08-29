@@ -55,7 +55,7 @@ impl AgentState {
             cloud = cloud.with_token(&token);
         }
         let checkpoint_store = CheckpointStore::new(CheckpointStore::default_path());
-        let checkpoint = checkpoint_store.load()?;
+        let checkpoint = checkpoint_store.load().unwrap_or_default();
 
         let status = AgentStatus {
             paired: Vault::is_paired(),

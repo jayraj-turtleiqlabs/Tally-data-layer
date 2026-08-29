@@ -56,7 +56,16 @@ impl CheckpointStore {
         }
         let data = fs::read_to_string(&self.path)
             .map_err(|e| CheckpointError::Read(e.to_string()))?;
-        serde_json::from_str(&data).map_err(|e| CheckpointError::Read(e.to_string()))
+        if data.trim().is_empty() {
+            return Ok(Checkpoint::default());
+        }
+        match serde_json::from_str(&data) {
+            Ok(cp) => Ok(cp),
+            Err(e) => {
+                eprintln!("[checkpoint] Warning: Failed to parse checkpoint JSON ({e}). Falling back to default.");
+                Ok(Checkpoint::default())
+            }
+        }
     }
 
     pub fn save(&self, checkpoint: &Checkpoint) -> Result<(), CheckpointError> {
@@ -101,5 +110,27 @@ mod tests {
         store.advance_on_ack(500, false).unwrap();
         let cp2 = store.load().unwrap();
         assert_eq!(cp2.last_known_alter_id, 500);
+    }
+
+    #[test]
+    fn checkpoint_handles_empty_and_corrupt_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty_cp.json");
+
+        // Empty file
+        fs::write(&path, "").unwrap();
+        let store = CheckpointStore::new(path.clone());
+        let cp = store.load().unwrap();
+        assert_eq!(cp, Checkpoint::default());
+
+        // Whitespace-only file
+        fs::write(&path, "   \n\t  ").unwrap();
+        let cp = store.load().unwrap();
+        assert_eq!(cp, Checkpoint::default());
+
+        // Malformed JSON
+        fs::write(&path, "{invalid-json").unwrap();
+        let cp = store.load().unwrap();
+        assert_eq!(cp, Checkpoint::default());
     }
 }
