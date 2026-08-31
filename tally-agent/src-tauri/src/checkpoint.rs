@@ -54,16 +54,30 @@ impl CheckpointStore {
         if !self.path.exists() {
             return Ok(Checkpoint::default());
         }
-        let data = fs::read_to_string(&self.path)
-            .map_err(|e| CheckpointError::Read(e.to_string()))?;
-        if data.trim().is_empty() {
-            return Ok(Checkpoint::default());
+        let data = match fs::read_to_string(&self.path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[checkpoint] Warning: Failed to read checkpoint file ({e}). Resetting to default.");
+                let default_cp = Checkpoint::default();
+                let _ = self.save(&default_cp);
+                return Ok(default_cp);
+            }
+        };
+
+        let trimmed = data.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+        if trimmed.is_empty() {
+            let default_cp = Checkpoint::default();
+            let _ = self.save(&default_cp);
+            return Ok(default_cp);
         }
-        match serde_json::from_str(&data) {
+
+        match serde_json::from_str(trimmed) {
             Ok(cp) => Ok(cp),
             Err(e) => {
-                eprintln!("[checkpoint] Warning: Failed to parse checkpoint JSON ({e}). Falling back to default.");
-                Ok(Checkpoint::default())
+                eprintln!("[checkpoint] Warning: Failed to parse checkpoint JSON ({e}). Resetting to default.");
+                let default_cp = Checkpoint::default();
+                let _ = self.save(&default_cp);
+                Ok(default_cp)
             }
         }
     }
@@ -125,6 +139,11 @@ mod tests {
 
         // Whitespace-only file
         fs::write(&path, "   \n\t  ").unwrap();
+        let cp = store.load().unwrap();
+        assert_eq!(cp, Checkpoint::default());
+
+        // Null-byte padded file
+        fs::write(&path, "\0\0\0\0\0\0\0\0").unwrap();
         let cp = store.load().unwrap();
         assert_eq!(cp, Checkpoint::default());
 

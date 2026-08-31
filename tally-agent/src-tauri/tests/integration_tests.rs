@@ -195,3 +195,109 @@ async fn retry_after_failure_sync_orchestrator() {
 
     Vault::delete_token().ok();
 }
+
+#[tokio::test]
+async fn test_device_auth_approved_stores_token_via_shared_path() {
+    let _ = Vault::delete_token();
+
+    // 1. Mock Tally instance on loopback port
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>50</ALTERID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // 2. Mock Cloud Backend for delta sync (backfill)
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    let company = agent_state
+        .complete_pairing_with_token("test-approved-agent-token-999", "Acme Corp Ltd")
+        .await
+        .unwrap();
+
+    assert_eq!(company, "Acme Corp Ltd");
+    assert!(Vault::is_paired());
+    assert_eq!(Vault::get_token().unwrap(), "test-approved-agent-token-999");
+
+    let status = agent_state.get_status().await;
+    assert!(status.paired);
+    assert_eq!(status.company_name, Some("Acme Corp Ltd".into()));
+
+    Vault::delete_token().ok();
+}
+
+#[tokio::test]
+async fn test_device_auth_denied_stops_polling_and_no_token() {
+    let _ = Vault::delete_token();
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "denied"
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let client = CloudClient::from_base_url(&cloud_server.uri()).unwrap();
+    let session = fininsight_tally_agent_lib::device_auth::DeviceAuthSession {
+        device_code: "dev-denied".into(),
+        user_code: "USER-DENIED".into(),
+        verification_uri: "http://example.com/device".into(),
+        poll_interval_secs: 1,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+    };
+
+    let result = fininsight_tally_agent_lib::device_auth::poll_until_complete(&client, &session).await.unwrap();
+    assert_eq!(result, fininsight_tally_agent_lib::device_auth::DeviceAuthStatus::Denied);
+    assert!(!Vault::is_paired());
+
+    // Verify exactly 1 request was sent before stopping immediately
+    let reqs = cloud_server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "Polling must stop immediately upon Denied response");
+}
+
+#[tokio::test]
+async fn test_device_auth_expired_stops_polling() {
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "expired"
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let client = CloudClient::from_base_url(&cloud_server.uri()).unwrap();
+    let session = fininsight_tally_agent_lib::device_auth::DeviceAuthSession {
+        device_code: "dev-expired".into(),
+        user_code: "USER-EXPIRED".into(),
+        verification_uri: "http://example.com/device".into(),
+        poll_interval_secs: 1,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+    };
+
+    let result = fininsight_tally_agent_lib::device_auth::poll_until_complete(&client, &session).await.unwrap();
+    assert_eq!(result, fininsight_tally_agent_lib::device_auth::DeviceAuthStatus::Expired);
+
+    let reqs = cloud_server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "Polling must stop immediately upon Expired response");
+}

@@ -152,3 +152,136 @@ input[type="text"] {
 }
 
 .error.hidden { display: none; }
+
+/* Browser Login Flow Styles */
+.browser-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #2563eb, #3b82f6);
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
+  font-size: 1rem;
+  padding: 14px;
+}
+
+.browser-btn:hover:not(:disabled) {
+  background: linear-gradient(135deg, #1d4ed8, #2563eb);
+  box-shadow: 0 6px 18px rgba(37, 99, 235, 0.45);
+}
+
+.btn-icon {
+  flex-shrink: 0;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  margin: 18px 0 14px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  border-bottom: 1px solid var(--border);
+}
+
+.divider span {
+  padding: 0 10px;
+}
+
+.user-code-container {
+  background: var(--bg);
+  border: 1px solid #3b82f640;
+  border-radius: var(--radius);
+  padding: 16px;
+  text-align: center;
+  margin: 12px 0 16px;
+}
+
+.user-code-label {
+  display: block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.user-code-value {
+  font-family: "Consolas", "SFMono-Regular", Menlo, monospace;
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: #60a5fa;
+  user-select: all;
+}
+
+.polling-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 10px;
+  background: rgba(59, 130, 246, 0.08);
+  border-radius: var(--radius);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(59, 130, 246, 0.2);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.auth-status-text {
+  font-size: 0.875rem;
+  color: var(--text);
+  margin: 0;
+  font-weight: 500;
+}
+
+.fallback-container {
+  margin: 14px 0 16px;
+  padding: 12px;
+  background: rgba(15, 20, 25, 0.6);
+  border-radius: var(--radius);
+  text-align: center;
+  border: 1px dashed var(--border);
+}
+
+.fallback-hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0 0 6px;
+}
+
+.fallback-link {
+  color: #60a5fa;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-decoration: none;
+  display: inline-block;
+  transition: color 0.15s;
+}
+
+.fallback-link:hover {
+  color: #93c5fd;
+  text-decoration: underline;
+}

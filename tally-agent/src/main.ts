@@ -12,12 +12,29 @@ interface AgentStatus {
   backfill_complete: boolean;
 }
 
+interface DeviceAuthPublicSession {
+  user_code: string;
+  verification_uri: string;
+  browser_opened: boolean;
+}
+
 const pairSection = document.getElementById("pair-section")!;
+const pairDefaultView = document.getElementById("pair-default-view")!;
+const browserAuthView = document.getElementById("browser-auth-view")!;
 const pairedSection = document.getElementById("paired-section")!;
 const connectionBadge = document.getElementById("connection-badge")!;
+
+const browserLoginBtn = document.getElementById("browser-login-btn") as HTMLButtonElement;
+const userCodeDisplay = document.getElementById("user-code-display")!;
+const browserAuthStatus = document.getElementById("browser-auth-status")!;
+const browserAuthLink = document.getElementById("browser-auth-link") as HTMLAnchorElement;
+const browserAuthError = document.getElementById("browser-auth-error")!;
+const cancelBrowserBtn = document.getElementById("cancel-browser-btn") as HTMLButtonElement;
+
 const pairingCodeInput = document.getElementById("pairing-code") as HTMLInputElement;
 const pairBtn = document.getElementById("pair-btn") as HTMLButtonElement;
 const pairError = document.getElementById("pair-error")!;
+
 const companyName = document.getElementById("company-name")!;
 const tallyStatus = document.getElementById("tally-status")!;
 const lastSync = document.getElementById("last-sync")!;
@@ -25,6 +42,8 @@ const alterId = document.getElementById("alter-id")!;
 const syncError = document.getElementById("sync-error")!;
 const syncBtn = document.getElementById("sync-btn") as HTMLButtonElement;
 const disconnectBtn = document.getElementById("disconnect-btn") as HTMLButtonElement;
+
+let isPollingDeviceAuth = false;
 
 function formatDate(iso: string | null): string {
   if (!iso) return "Never";
@@ -87,6 +106,66 @@ async function refreshStatus() {
     connectionBadge.className = "badge badge-error";
   }
 }
+
+function resetBrowserAuthView() {
+  isPollingDeviceAuth = false;
+  browserAuthView.classList.add("hidden");
+  pairDefaultView.classList.remove("hidden");
+  browserAuthError.classList.add("hidden");
+  browserLoginBtn.disabled = false;
+}
+
+browserLoginBtn.addEventListener("click", async () => {
+  browserLoginBtn.disabled = true;
+  pairError.classList.add("hidden");
+  browserAuthError.classList.add("hidden");
+
+  try {
+    const session = await invoke<DeviceAuthPublicSession>("initiate_device_login");
+    
+    // Switch to browser auth view
+    pairDefaultView.classList.add("hidden");
+    browserAuthView.classList.remove("hidden");
+    
+    userCodeDisplay.textContent = session.user_code;
+    browserAuthLink.href = session.verification_uri;
+    browserAuthStatus.textContent = "Waiting for you to approve in your browser…";
+    isPollingDeviceAuth = true;
+
+    // Start background polling
+    try {
+      const company = await invoke<string>("poll_device_login");
+      if (isPollingDeviceAuth) {
+        browserAuthStatus.textContent = "Approved! Setting up your connection…";
+        companyName.textContent = company;
+        await refreshStatus();
+        resetBrowserAuthView();
+      }
+    } catch (pollErr) {
+      if (isPollingDeviceAuth) {
+        const errorMsg = typeof pollErr === "string" ? pollErr : "Login was denied or expired — try again";
+        browserAuthError.textContent = errorMsg;
+        browserAuthError.classList.remove("hidden");
+        browserAuthStatus.textContent = "Authorization failed";
+      }
+    }
+  } catch (initErr) {
+    const errorMsg = typeof initErr === "string" ? initErr : "Failed to start browser login. Ensure Tally is running.";
+    pairError.textContent = errorMsg;
+    pairError.classList.remove("hidden");
+    browserLoginBtn.disabled = false;
+  }
+});
+
+cancelBrowserBtn.addEventListener("click", async () => {
+  isPollingDeviceAuth = false;
+  try {
+    await invoke("cancel_device_login");
+  } catch {
+    // Ignore cancel errors
+  }
+  resetBrowserAuthView();
+});
 
 pairBtn.addEventListener("click", async () => {
   const code = pairingCodeInput.value.trim();

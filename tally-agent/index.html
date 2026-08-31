@@ -14,18 +14,55 @@
       </header>
 
       <section id="pair-section" class="card hidden">
-        <h2>Pair with FinInsight</h2>
-        <p class="hint">Enter the 8-character code from your FinInsight dashboard.</p>
-        <input
-          id="pairing-code"
-          type="text"
-          maxlength="8"
-          placeholder="ABCD1234"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <button id="pair-btn" class="btn primary">Pair</button>
-        <p id="pair-error" class="error hidden"></p>
+        <div id="pair-default-view">
+          <h2>Connect to FinInsight</h2>
+          <p class="hint">Authorize this agent with your FinInsight account.</p>
+          
+          <button id="browser-login-btn" class="btn primary browser-btn">
+            <svg class="btn-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/>
+            </svg>
+            Login with FinInsight
+          </button>
+
+          <div class="divider">
+            <span>or enter pairing code manually</span>
+          </div>
+
+          <input
+            id="pairing-code"
+            type="text"
+            maxlength="8"
+            placeholder="ABCD1234"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button id="pair-btn" class="btn secondary">Pair with Code</button>
+          <p id="pair-error" class="error hidden"></p>
+        </div>
+
+        <div id="browser-auth-view" class="hidden">
+          <h2>Browser Login</h2>
+          <p class="hint">Approve the connection in your browser window.</p>
+          
+          <div class="user-code-container">
+            <span class="user-code-label">Confirmation Code</span>
+            <div id="user-code-display" class="user-code-value">----</div>
+          </div>
+
+          <div class="polling-indicator">
+            <div class="spinner"></div>
+            <p id="browser-auth-status" class="auth-status-text">Waiting for you to approve in your browser…</p>
+          </div>
+
+          <div id="browser-fallback-container" class="fallback-container">
+            <p class="fallback-hint">Browser didn't open automatically?</p>
+            <a id="browser-auth-link" class="fallback-link" href="#" target="_blank">Open FinInsight Approval Page ↗</a>
+          </div>
+
+          <p id="browser-auth-error" class="error hidden"></p>
+          <button id="cancel-browser-btn" class="btn secondary">Cancel</button>
+        </div>
       </section>
 
       <section id="paired-section" class="card hidden">

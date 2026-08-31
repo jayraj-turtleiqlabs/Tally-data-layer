@@ -46,6 +46,12 @@ pub enum ApiError {
 
     #[error("Invalid API response: {0}")]
     InvalidResponse(String),
+
+    #[error("Login was denied — try again")]
+    DeviceAuthDenied,
+
+    #[error("This login request expired — try again")]
+    DeviceAuthExpired,
 }
 
 #[derive(Debug, Error)]

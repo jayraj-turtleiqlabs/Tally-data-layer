@@ -1,5 +1,6 @@
 pub mod checkpoint;
 pub mod cloud_client;
+pub mod device_auth;
 pub mod errors;
 pub mod logging;
 pub mod redact;
@@ -17,7 +18,8 @@ use tokio::time::{interval, Duration};
 
 use crate::checkpoint::{Checkpoint, CheckpointStore};
 use crate::cloud_client::{CloudClient, HeartbeatPayload};
-use crate::errors::AgentError;
+use crate::device_auth::DeviceAuthSession;
+use crate::errors::{AgentError, ApiError};
 use crate::redact::redact;
 use crate::sync::{SyncOrchestrator, SyncResult};
 use crate::tally_client::{TallyClient, TallyEndpoint};
@@ -25,6 +27,13 @@ use crate::vault::Vault;
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 45;
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceAuthPublicSession {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub browser_opened: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AgentStatus {
@@ -41,20 +50,33 @@ pub struct AgentStatus {
 
 pub struct AgentState {
     pub tally_port: u16,
+    pub cloud_base_url: Option<String>,
     pub status: RwLock<AgentStatus>,
     pub orchestrator: Mutex<Option<SyncOrchestrator>>,
     pub checkpoint_store: CheckpointStore,
+    pub active_device_session: Mutex<Option<DeviceAuthSession>>,
 }
 
 impl AgentState {
     pub fn new(tally_port: u16) -> Result<Self, AgentError> {
+        Self::with_options(tally_port, None, CheckpointStore::default_path())
+    }
+
+    pub fn with_options(
+        tally_port: u16,
+        cloud_base_url: Option<String>,
+        checkpoint_path: std::path::PathBuf,
+    ) -> Result<Self, AgentError> {
         let endpoint = TallyEndpoint::new("127.0.0.1", tally_port)?;
         let tally = TallyClient::new(endpoint)?;
-        let mut cloud = CloudClient::new()?;
+        let mut cloud = match &cloud_base_url {
+            Some(url) => CloudClient::from_base_url(url)?,
+            None => CloudClient::new()?,
+        };
         if let Ok(token) = Vault::get_token() {
             cloud = cloud.with_token(&token);
         }
-        let checkpoint_store = CheckpointStore::new(CheckpointStore::default_path());
+        let checkpoint_store = CheckpointStore::new(checkpoint_path);
         let checkpoint = checkpoint_store.load().unwrap_or_default();
 
         let status = AgentStatus {
@@ -69,6 +91,7 @@ impl AgentState {
 
         Ok(Self {
             tally_port,
+            cloud_base_url,
             status: RwLock::new(status),
             orchestrator: Mutex::new(Some(SyncOrchestrator::new(
                 tally,
@@ -76,7 +99,15 @@ impl AgentState {
                 checkpoint_store.clone(),
             ))),
             checkpoint_store,
+            active_device_session: Mutex::new(None),
         })
+    }
+
+    pub fn new_cloud_client(&self) -> Result<CloudClient, ApiError> {
+        match &self.cloud_base_url {
+            Some(url) => CloudClient::from_base_url(url),
+            None => CloudClient::new(),
+        }
     }
 
     pub async fn refresh_status(&self) {
@@ -104,6 +135,43 @@ impl AgentState {
         client.ping().await.is_ok()
     }
 
+    pub async fn complete_pairing_with_token(
+        &self,
+        token: &str,
+        company_name: &str,
+    ) -> Result<String, AgentError> {
+        println!("[pair] Storing agent token in vault...");
+        Vault::store_token(token)?;
+        println!("[pair] Token stored");
+
+        {
+            let mut status = self.status.write().await;
+            status.paired = true;
+            status.company_name = Some(company_name.to_string());
+            status.last_error = None;
+        }
+
+        // Rebuild orchestrator with fresh clients
+        {
+            let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
+            let tally = TallyClient::new(endpoint)?;
+            let cloud = self.new_cloud_client()?.with_token(token);
+            let mut orch = self.orchestrator.lock().await;
+            *orch = Some(SyncOrchestrator::new(
+                tally,
+                cloud,
+                self.checkpoint_store.clone(),
+            ));
+        }
+
+        println!("[pair] Running initial backfill...");
+        // Automatic initial backfill after pairing
+        self.run_backfill_internal().await?;
+        println!("[pair] Backfill complete");
+
+        Ok(company_name.to_string())
+    }
+
     pub async fn pair(&self, code: &str) -> Result<String, AgentError> {
         println!("[pair] Step 1: Creating TallyEndpoint on 127.0.0.1:{}", self.tally_port);
         let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
@@ -122,7 +190,7 @@ impl AgentState {
         };
 
         println!("[pair] Step 3: Creating CloudClient...");
-        let cloud = CloudClient::new()?;
+        let cloud = self.new_cloud_client()?;
 
         println!("[pair] Step 4: Sending pair request to cloud with code='{}'", &code[..code.len().min(4)]);
         let response = match cloud.pair(code, &company.company_name).await {
@@ -136,37 +204,87 @@ impl AgentState {
             }
         };
 
-        println!("[pair] Step 5: Storing agent token in vault...");
         let token = response.token()?;
-        Vault::store_token(&token)?;
-        println!("[pair] Step 5 OK: Token stored");
+        self.complete_pairing_with_token(&token, &company.company_name).await
+    }
 
-        {
-            let mut status = self.status.write().await;
-            status.paired = true;
-            status.company_name = Some(company.company_name.clone());
-            status.last_error = None;
+    pub async fn start_device_login(&self) -> Result<DeviceAuthPublicSession, AgentError> {
+        println!("[device_login] Step 1: Checking Tally reachable...");
+        let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
+        let tally = TallyClient::new(endpoint)?;
+        let _ = tally.ping().await?;
+
+        println!("[device_login] Step 2: Requesting device authorization session...");
+        let cloud = self.new_cloud_client()?;
+        let session = crate::device_auth::initiate_device_auth(&cloud).await?;
+
+        println!("[device_login] Step 3: Opening system browser to {}", &session.verification_uri);
+        let browser_opened = opener::open(&session.verification_uri).is_ok();
+        if !browser_opened {
+            log::warn!("System browser could not be launched automatically");
         }
 
-        // Rebuild orchestrator with fresh clients
+        let public_info = DeviceAuthPublicSession {
+            user_code: session.user_code.clone(),
+            verification_uri: session.verification_uri.clone(),
+            browser_opened,
+        };
+
         {
-            let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
-            let tally = TallyClient::new(endpoint)?;
-            let cloud = CloudClient::new()?.with_token(&token);
-            let mut orch = self.orchestrator.lock().await;
-            *orch = Some(SyncOrchestrator::new(
-                tally,
-                cloud,
-                self.checkpoint_store.clone(),
-            ));
+            let mut active = self.active_device_session.lock().await;
+            *active = Some(session);
         }
 
-        println!("[pair] Step 6: Running initial backfill...");
-        // Automatic initial backfill after pairing
-        self.run_backfill_internal().await?;
-        println!("[pair] Step 6 OK: Backfill complete");
+        Ok(public_info)
+    }
 
-        Ok(company.company_name)
+    pub async fn poll_device_login(&self) -> Result<String, AgentError> {
+        let session = {
+            let active = self.active_device_session.lock().await;
+            active.clone().ok_or_else(|| AgentError::Other("No active device authorization session".into()))?
+        };
+
+        let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
+        let tally = TallyClient::new(endpoint)?;
+        let company = tally.ping().await?;
+
+        let cloud = self.new_cloud_client()?;
+        println!("[device_login] Step 4: Polling backend for user approval...");
+        let status = crate::device_auth::poll_until_complete(&cloud, &session).await?;
+
+        // Clear active session
+        {
+            let mut active = self.active_device_session.lock().await;
+            *active = None;
+        }
+
+        match status {
+            crate::device_auth::DeviceAuthStatus::Approved { agent_token, .. } => {
+                println!("[device_login] Step 5: Device approved! Setting up connection...");
+                self.complete_pairing_with_token(&agent_token, &company.company_name).await
+            }
+            crate::device_auth::DeviceAuthStatus::Denied => {
+                println!("[device_login] Device authorization was denied");
+                Err(AgentError::Api(crate::errors::ApiError::DeviceAuthDenied))
+            }
+            crate::device_auth::DeviceAuthStatus::Expired => {
+                println!("[device_login] Device authorization expired");
+                Err(AgentError::Api(crate::errors::ApiError::DeviceAuthExpired))
+            }
+            _ => Err(AgentError::Api(crate::errors::ApiError::InvalidResponse(
+                "Device authorization concluded without approval".into(),
+            ))),
+        }
+    }
+
+    pub async fn cancel_device_login(&self) {
+        let mut active = self.active_device_session.lock().await;
+        *active = None;
+    }
+
+    pub async fn login_via_browser(&self) -> Result<String, AgentError> {
+        let _ = self.start_device_login().await?;
+        self.poll_device_login().await
     }
 
     pub async fn disconnect(&self) -> Result<(), AgentError> {

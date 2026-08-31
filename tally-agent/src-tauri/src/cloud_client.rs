@@ -3,6 +3,9 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::device_auth::{
+    DeviceInitiateRequest, DeviceInitiateResponse, DevicePollRequest, DevicePollResponse,
+};
 use crate::errors::ApiError;
 use crate::redact::redact;
 use crate::vault::Vault;
@@ -214,6 +217,78 @@ impl CloudClient {
         serde_json::from_str::<PairResponse>(&text).map_err(|e| {
             println!("[cloud_client] Deserialization error: {} for text: {}", e, text);
             ApiError::InvalidResponse(redact(&e.to_string()))
+        })
+    }
+
+    /// POST /api/v1/agent/device/initiate — requests device authorization codes.
+    pub async fn initiate_device(
+        &self,
+        request: &DeviceInitiateRequest,
+    ) -> Result<DeviceInitiateResponse, ApiError> {
+        log::info!("Device authorization initiation attempt");
+
+        let resp = self
+            .http
+            .post(self.url("/api/v1/agent/device/initiate"))
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        if !status.is_success() {
+            log::warn!("Device initiate failed with status {}: {}", status, text);
+            return Err(ApiError::InvalidResponse(format!(
+                "Device initiate failed with HTTP {}: {}",
+                status,
+                redact(&text)
+            )));
+        }
+
+        serde_json::from_str::<DeviceInitiateResponse>(&text).map_err(|e| {
+            ApiError::InvalidResponse(format!(
+                "Invalid device initiate response: {}",
+                redact(&e.to_string())
+            ))
+        })
+    }
+
+    /// POST /api/v1/agent/device/poll — polls device authorization status.
+    pub async fn poll_device(&self, device_code: &str) -> Result<DevicePollResponse, ApiError> {
+        let body = DevicePollRequest { device_code };
+        let resp = self
+            .http
+            .post(self.url("/api/v1/agent/device/poll"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        if !status.is_success() && status.as_u16() != 400 {
+            log::warn!("Device poll failed with status {}: {}", status, text);
+            return Err(ApiError::InvalidResponse(format!(
+                "Device poll HTTP {}: {}",
+                status,
+                redact(&text)
+            )));
+        }
+
+        serde_json::from_str::<DevicePollResponse>(&text).map_err(|e| {
+            ApiError::InvalidResponse(format!(
+                "Invalid device poll response: {}",
+                redact(&e.to_string())
+            ))
         })
     }
 

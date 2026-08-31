@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use fininsight_tally_agent_lib::{spawn_heartbeat_loop, AgentState, AgentStatus};
+use fininsight_tally_agent_lib::{
+    spawn_heartbeat_loop, AgentState, AgentStatus, DeviceAuthPublicSession,
+};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -34,6 +36,56 @@ async fn pair_agent(
         .map_err(|e| {
             let msg = format!("{}", e);
             println!("[pair_agent] Error: {}", msg);
+            msg
+        })
+}
+
+#[tauri::command]
+async fn initiate_device_login(
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<DeviceAuthPublicSession, String> {
+    state
+        .start_device_login()
+        .await
+        .map_err(|e| {
+            let msg = format!("{}", e);
+            println!("[initiate_device_login] Error: {}", msg);
+            msg
+        })
+}
+
+#[tauri::command]
+async fn poll_device_login(
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<String, String> {
+    state
+        .poll_device_login()
+        .await
+        .map_err(|e| {
+            let msg = format!("{}", e);
+            println!("[poll_device_login] Error: {}", msg);
+            msg
+        })
+}
+
+#[tauri::command]
+async fn cancel_device_login(
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    state.cancel_device_login().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn login_via_browser(
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<String, String> {
+    state
+        .login_via_browser()
+        .await
+        .map_err(|e| {
+            let msg = format!("{}", e);
+            println!("[login_via_browser] Error: {}", msg);
             msg
         })
 }
@@ -86,6 +138,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_agent_status,
             pair_agent,
+            initiate_device_login,
+            poll_device_login,
+            cancel_device_login,
+            login_via_browser,
             sync_now,
             disconnect_agent,
             show_window,
