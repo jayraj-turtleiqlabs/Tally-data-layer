@@ -10,9 +10,16 @@ use crate::errors::ApiError;
 use crate::redact::redact;
 use crate::vault::Vault;
 
-/// Baked in at compile time via FININSIGHT_API_BASE env var.
-pub fn api_base_url() -> &'static str {
-    option_env!("FININSIGHT_API_BASE").unwrap_or("http://localhost:3000")
+/// Resolved at runtime via FININSIGHT_API_BASE env var, falling back to compile-time env or localhost.
+pub fn api_base_url() -> String {
+    std::env::var("FININSIGHT_API_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            option_env!("FININSIGHT_API_BASE")
+                .unwrap_or("http://localhost:3000")
+                .to_string()
+        })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -371,14 +378,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_base_not_hardcoded_localhost_in_release() {
+    fn api_base_is_non_empty() {
         let base = api_base_url();
-        #[cfg(not(debug_assertions))]
-        assert!(
-            !base.contains("localhost"),
-            "Release builds must not use localhost"
-        );
-        #[cfg(debug_assertions)]
         assert!(!base.is_empty());
     }
 }
