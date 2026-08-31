@@ -34,7 +34,6 @@
       "icons/icon.ico"
     ],
     "windows": {
-      "certificateThumbprint": "${TAURI_SIGNING_CERTIFICATE_THUMBPRINT}",
       "digestAlgorithm": "sha256",
       "timestampUrl": "http://timestamp.digicert.com"
     }
