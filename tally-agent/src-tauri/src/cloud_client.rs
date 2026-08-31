@@ -10,14 +10,14 @@ use crate::errors::ApiError;
 use crate::redact::redact;
 use crate::vault::Vault;
 
-/// Resolved at runtime via FININSIGHT_API_BASE env var, falling back to compile-time env or localhost.
+/// Resolved at runtime via FININSIGHT_API_BASE env var, falling back to compile-time env or production Render base.
 pub fn api_base_url() -> String {
     std::env::var("FININSIGHT_API_BASE")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| {
             option_env!("FININSIGHT_API_BASE")
-                .unwrap_or("http://localhost:3000")
+                .unwrap_or("https://fininsight-api-vzv5.onrender.com")
                 .to_string()
         })
 }
