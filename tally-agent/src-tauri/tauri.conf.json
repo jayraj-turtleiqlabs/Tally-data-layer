@@ -16,6 +16,13 @@
         "width": 420,
         "height": 520,
         "resizable": false,
+        "maximizable": false,
+        "fullscreen": false,
+        "maximized": false,
+        "minWidth": 420,
+        "minHeight": 520,
+        "maxWidth": 420,
+        "maxHeight": 520,
         "visible": false
       }
     ],
