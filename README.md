@@ -63,10 +63,16 @@ npm run dev
 See [`tally-agent/README.md`]
 (tally-agent/README.md) for the agent implementation sequence and test plan.
 
-### To build the exe file
+### Build Standalone Production EXE
 
-$env:FININSIGHT_API_BASE="base-url-link 'for eg: https://fininsight-api-vzv5.onrender.com' "
+```powershell
+# From workspace root or inside tally-agent:
+cd tally-agent
+$env:FININSIGHT_API_BASE = "https://fininsight-api-vzv5.onrender.com"
 npm run build:exe
+```
+
+The single `.exe` file will be generated in `tally-agent/release-exe/fininsight-tally-agent.exe`.
 
 ## Security Checklist
 

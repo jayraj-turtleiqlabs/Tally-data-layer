@@ -1,0 +1,10 @@
+{
+  "name": "fininsight-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build:exe": "npm --prefix tally-agent run build:exe",
+    "dev:agent": "npm --prefix tally-agent run tauri dev",
+    "dev:web": "npm --prefix fininsight-web run dev"
+  }
+}
