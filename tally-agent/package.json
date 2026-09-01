@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:exe": "node scripts/build-exe.js",
+    "build:tauri": "tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"

@@ -60,7 +60,13 @@ npm run dev
 
 ## Build Order
 
-See [`tally-agent/README.md`](tally-agent/README.md) for the agent implementation sequence and test plan.
+See [`tally-agent/README.md`]
+(tally-agent/README.md) for the agent implementation sequence and test plan.
+
+### To build the exe file
+
+$env:FININSIGHT_API_BASE="base-url-link 'for eg: https://fininsight-api-vzv5.onrender.com' "
+npm run build:exe
 
 ## Security Checklist
 

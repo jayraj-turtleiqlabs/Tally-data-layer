@@ -9,6 +9,8 @@ target/
 # Tauri
 tally-agent/src-tauri/target/
 tally-agent/src-tauri/gen/
+release-exe/
+tally-agent/release-exe/
 
 # OS
 .DS_Store
