@@ -47,6 +47,9 @@ pub enum ApiError {
     #[error("Invalid API response: {0}")]
     InvalidResponse(String),
 
+    #[error("Agent token has been revoked or expired")]
+    TokenRevoked,
+
     #[error("Login was denied — try again")]
     DeviceAuthDenied,
 

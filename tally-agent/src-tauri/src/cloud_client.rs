@@ -314,6 +314,11 @@ impl CloudClient {
         let status = resp.status();
         println!("[cloud_client] Initial batch {}/{} response HTTP {}", batch.batch_index + 1, batch.total_batches, status);
 
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            log::warn!("Initial batch push returned HTTP {} - token revoked or unauthorized", status);
+            return Err(ApiError::TokenRevoked);
+        }
+
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             println!("[cloud_client] Initial batch failed body: {}", body);
@@ -337,6 +342,11 @@ impl CloudClient {
         let status = resp.status();
         println!("[cloud_client] Delta sync response HTTP {}", status);
 
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            log::warn!("Delta sync push returned HTTP {} - token revoked or unauthorized", status);
+            return Err(ApiError::TokenRevoked);
+        }
+
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             println!("[cloud_client] Delta sync failed body: {}", body);
@@ -356,6 +366,11 @@ impl CloudClient {
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
+            log::warn!("Heartbeat returned HTTP {} - token revoked or unauthorized", resp.status());
+            return Err(ApiError::TokenRevoked);
+        }
 
         if !resp.status().is_success() {
             return Err(ApiError::HeartbeatFailed(resp.status().as_u16()));

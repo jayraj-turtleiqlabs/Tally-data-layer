@@ -174,27 +174,6 @@ input[type="text"] {
   flex-shrink: 0;
 }
 
-.divider {
-  display: flex;
-  align-items: center;
-  margin: 18px 0 14px;
-  color: var(--muted);
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.divider::before,
-.divider::after {
-  content: "";
-  flex: 1;
-  border-bottom: 1px solid var(--border);
-}
-
-.divider span {
-  padding: 0 10px;
-}
-
 .user-code-container {
   background: var(--bg);
   border: 1px solid #3b82f640;

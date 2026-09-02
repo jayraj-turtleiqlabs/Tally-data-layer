@@ -297,6 +297,19 @@ impl AgentState {
         Ok(())
     }
 
+    pub async fn handle_token_revoked(&self) {
+        log::warn!("Agent token has been revoked or expired. Clearing credentials and prompting re-pairing.");
+        let _ = Vault::delete_token();
+        let _ = self.checkpoint_store.save(&Checkpoint::default());
+
+        let mut status = self.status.write().await;
+        status.paired = false;
+        status.company_name = None;
+        status.last_error = Some("Agent token was revoked or expired. Please re-connect.".into());
+        status.sync_in_progress = false;
+        status.sync_idle = true;
+    }
+
     pub async fn sync_now(&self) -> Result<SyncResult, AgentError> {
         let orch_guard = self.orchestrator.lock().await;
         let orch = orch_guard
@@ -326,6 +339,14 @@ impl AgentState {
         } else {
             orch.run_initial_backfill().await
         };
+
+        match &result {
+            Err(AgentError::Api(ApiError::TokenRevoked)) => {
+                self.handle_token_revoked().await;
+                return Err(AgentError::Api(ApiError::TokenRevoked));
+            }
+            _ => {}
+        }
 
         {
             let mut status = self.status.write().await;
@@ -419,7 +440,7 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            let cloud = match CloudClient::new() {
+            let cloud = match state.new_cloud_client() {
                 Ok(c) => c.with_token(&token),
                 Err(_) => continue,
             };
@@ -430,26 +451,38 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
                 last_known_alter_id: checkpoint.last_known_alter_id,
             };
 
-            if let Ok(resp) = cloud.heartbeat(&payload).await {
-                // Dashboard-triggered sync: poll flag piggybacked on heartbeat
-                if resp.is_sync_requested() && !state.orchestrator.lock().await.as_ref().map(|o| o.is_sync_in_progress()).unwrap_or(false) {
-                    log::info!("Dashboard requested sync via heartbeat poll flag");
-                    match state.sync_now().await {
-                        Ok(res) => {
-                            if !res.success {
-                                let err_msg = res.error_message.unwrap_or_else(|| "Sync failed".to_string());
-                                log::warn!("Dashboard-triggered sync completed with failure: {}", redact(&err_msg));
-                            } else {
-                                log::info!(
-                                    "Dashboard-triggered sync succeeded: {} records pushed",
-                                    res.records_pushed
-                                );
+            match cloud.heartbeat(&payload).await {
+                Ok(resp) => {
+                    // Dashboard-triggered sync: poll flag piggybacked on heartbeat
+                    if resp.is_sync_requested() && !state.orchestrator.lock().await.as_ref().map(|o| o.is_sync_in_progress()).unwrap_or(false) {
+                        log::info!("Dashboard requested sync via heartbeat poll flag");
+                        match state.sync_now().await {
+                            Ok(res) => {
+                                if !res.success {
+                                    let err_msg = res.error_message.unwrap_or_else(|| "Sync failed".to_string());
+                                    log::warn!("Dashboard-triggered sync completed with failure: {}", redact(&err_msg));
+                                } else {
+                                    log::info!(
+                                        "Dashboard-triggered sync succeeded: {} records pushed",
+                                        res.records_pushed
+                                    );
+                                }
+                            }
+                            Err(AgentError::Api(ApiError::TokenRevoked)) => {
+                                log::warn!("Dashboard-triggered sync stopped due to revoked token");
+                            }
+                            Err(e) => {
+                                log::error!("Dashboard-triggered sync failed: {}", redact(&e.to_string()));
                             }
                         }
-                        Err(e) => {
-                            log::error!("Dashboard-triggered sync failed: {}", redact(&e.to_string()));
-                        }
                     }
+                }
+                Err(ApiError::TokenRevoked) => {
+                    log::warn!("Heartbeat returned 401/403 (token revoked/expired). Resetting pairing.");
+                    state.handle_token_revoked().await;
+                }
+                Err(e) => {
+                    log::debug!("Heartbeat error: {:?}", e);
                 }
             }
         }

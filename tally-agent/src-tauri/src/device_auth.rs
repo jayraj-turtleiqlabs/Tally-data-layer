@@ -180,9 +180,11 @@ pub async fn poll_device_auth(
     }
 }
 
+pub const MAX_POLL_INTERVAL_SECS: u64 = 60;
+
 /// Polls repeatedly until the session is approved, denied, or expired.
 /// Respects `session.expires_at` as a hard ceiling.
-/// On `SlowDown`, increases the polling interval by 5 seconds.
+/// On `SlowDown`, increases the polling interval by 5 seconds (capped at MAX_POLL_INTERVAL_SECS).
 pub async fn poll_until_complete(
     cloud_client: &CloudClient,
     session: &DeviceAuthSession,
@@ -208,10 +210,13 @@ pub async fn poll_until_complete(
                 continue;
             }
             Ok(DeviceAuthStatus::SlowDown) => {
-                current_interval = current_interval.saturating_add(5);
+                current_interval = current_interval
+                    .saturating_add(5)
+                    .min(MAX_POLL_INTERVAL_SECS);
                 log::info!(
-                    "Device auth SlowDown received: increased poll interval to {}s",
-                    current_interval
+                    "Device auth SlowDown received: increased poll interval to {}s (capped at {}s)",
+                    current_interval,
+                    MAX_POLL_INTERVAL_SECS
                 );
                 continue;
             }
@@ -460,5 +465,18 @@ mod tests {
             }
             other => panic!("Expected Approved, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_poll_slowdown_interval_capped_at_max() {
+        // When current_interval is 58, 58 + 5 = 63, capped at MAX_POLL_INTERVAL_SECS (60)
+        let interval_near_max = 58u64;
+        let capped = interval_near_max.saturating_add(5).min(MAX_POLL_INTERVAL_SECS);
+        assert_eq!(capped, MAX_POLL_INTERVAL_SECS);
+
+        // When current_interval is already at or above 60
+        let interval_at_max = 60u64;
+        let capped_at_max = interval_at_max.saturating_add(5).min(MAX_POLL_INTERVAL_SECS);
+        assert_eq!(capped_at_max, MAX_POLL_INTERVAL_SECS);
     }
 }

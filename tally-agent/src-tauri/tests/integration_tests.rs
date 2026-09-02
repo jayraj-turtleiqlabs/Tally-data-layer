@@ -196,8 +196,11 @@ async fn retry_after_failure_sync_orchestrator() {
     Vault::delete_token().ok();
 }
 
+static VAULT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn test_device_auth_approved_stores_token_via_shared_path() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
     let _ = Vault::delete_token();
 
     // 1. Mock Tally instance on loopback port
@@ -246,6 +249,7 @@ async fn test_device_auth_approved_stores_token_via_shared_path() {
 
 #[tokio::test]
 async fn test_device_auth_denied_stops_polling_and_no_token() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
     let _ = Vault::delete_token();
 
     let cloud_server = MockServer::start().await;
@@ -300,4 +304,112 @@ async fn test_device_auth_expired_stops_polling() {
 
     let reqs = cloud_server.received_requests().await.unwrap();
     assert_eq!(reqs.len(), 1, "Polling must stop immediately upon Expired response");
+}
+
+#[tokio::test]
+async fn test_token_revocation_on_sync_clears_token_and_resets_status() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::delete_token();
+
+    // 1. Mock Tally instance on loopback port with a delta voucher
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Revoke Test Corp</NAME><ALTERID>50</ALTERID></COMPANY>
+    <VOUCHER>
+      <VOUCHERNUMBER>INV-REVOKE</VOUCHERNUMBER>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <DATE>20260401</DATE>
+      <ALTERID>150</ALTERID>
+      <AMOUNT>1000.00</AMOUNT>
+    </VOUCHER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // 2. Mock Cloud Backend to return 200 on initial backfill, but 401 Unauthorized on subsequent delta sync
+    let cloud_server = MockServer::start().await;
+
+    struct BackfillOkThen401 {
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl wiremock::Respond for BackfillOkThen401 {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let prev = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if prev == 0 {
+                ResponseTemplate::new(200) // Initial backfill
+            } else {
+                ResponseTemplate::new(401) // Delta sync revoked
+            }
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(BackfillOkThen401 {
+            count: std::sync::atomic::AtomicUsize::new(0),
+        })
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    // Initial pairing and backfill
+    agent_state
+        .complete_pairing_with_token("revoked-token-123", "Revoke Test Corp")
+        .await
+        .unwrap();
+    assert!(Vault::is_paired());
+
+    // Trigger delta sync_now — it encounters 401, invokes handle_token_revoked, and returns Err
+    let sync_result = agent_state.sync_now().await;
+    assert!(sync_result.is_err());
+
+    // Token must be deleted from vault
+    assert!(!Vault::is_paired(), "Vault must not be paired after token revocation");
+
+    // Agent status must reflect unpaired and display the re-pairing prompt error
+    let status = agent_state.get_status().await;
+    assert!(!status.paired);
+    assert_eq!(status.company_name, None);
+    assert!(status.last_error.is_some());
+    assert!(status.last_error.unwrap().contains("revoked or expired"));
+
+    Vault::delete_token().ok();
+}
+
+#[tokio::test]
+async fn test_token_revocation_on_heartbeat() {
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/heartbeat"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&cloud_server)
+        .await;
+
+    let client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("dead-token");
+
+    let payload = fininsight_tally_agent_lib::cloud_client::HeartbeatPayload {
+        tally_reachable: true,
+        agent_version: "0.1.0".into(),
+        last_known_alter_id: 100,
+    };
+
+    let result = client.heartbeat(&payload).await;
+    match result {
+        Err(fininsight_tally_agent_lib::errors::ApiError::TokenRevoked) => {}
+        other => panic!("Expected ApiError::TokenRevoked, got {:?}", other),
+    }
 }

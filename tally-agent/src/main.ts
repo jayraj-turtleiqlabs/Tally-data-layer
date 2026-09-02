@@ -30,9 +30,6 @@ const browserAuthStatus = document.getElementById("browser-auth-status")!;
 const browserAuthLink = document.getElementById("browser-auth-link") as HTMLAnchorElement;
 const browserAuthError = document.getElementById("browser-auth-error")!;
 const cancelBrowserBtn = document.getElementById("cancel-browser-btn") as HTMLButtonElement;
-
-const pairingCodeInput = document.getElementById("pairing-code") as HTMLInputElement;
-const pairBtn = document.getElementById("pair-btn") as HTMLButtonElement;
 const pairError = document.getElementById("pair-error")!;
 
 const companyName = document.getElementById("company-name")!;
@@ -59,7 +56,7 @@ function setBadge(status: AgentStatus) {
   if (status.sync_in_progress) {
     connectionBadge.textContent = "Syncing…";
     connectionBadge.classList.add("badge-syncing");
-  } else if (status.last_error) {
+  } else if (status.last_error && status.paired) {
     connectionBadge.textContent = "Error";
     connectionBadge.classList.add("badge-error");
   } else if (status.paired) {
@@ -94,6 +91,11 @@ function renderStatus(status: AgentStatus) {
   } else {
     pairSection.classList.remove("hidden");
     pairedSection.classList.add("hidden");
+
+    if (status.last_error) {
+      pairError.textContent = status.last_error;
+      pairError.classList.remove("hidden");
+    }
   }
 }
 
@@ -132,7 +134,7 @@ browserLoginBtn.addEventListener("click", async () => {
     browserAuthStatus.textContent = "Waiting for you to approve in your browser…";
     isPollingDeviceAuth = true;
 
-    // Start background polling
+    // Start polling backend for approval
     try {
       const company = await invoke<string>("poll_device_login");
       if (isPollingDeviceAuth) {
@@ -165,31 +167,6 @@ cancelBrowserBtn.addEventListener("click", async () => {
     // Ignore cancel errors
   }
   resetBrowserAuthView();
-});
-
-pairBtn.addEventListener("click", async () => {
-  const code = pairingCodeInput.value.trim();
-  if (code.length !== 8) {
-    pairError.textContent = "Pairing failed. Please check your code and try again.";
-    pairError.classList.remove("hidden");
-    return;
-  }
-
-  pairBtn.disabled = true;
-  pairError.classList.add("hidden");
-
-  try {
-    const company = await invoke<string>("pair_agent", { code });
-    companyName.textContent = company;
-    pairingCodeInput.value = "";
-    await refreshStatus();
-  } catch (e) {
-    pairError.textContent =
-      typeof e === "string" ? e : "Pairing failed. Please check your code and try again.";
-    pairError.classList.remove("hidden");
-  } finally {
-    pairBtn.disabled = false;
-  }
 });
 
 syncBtn.addEventListener("click", async () => {

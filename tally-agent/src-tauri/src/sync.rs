@@ -208,6 +208,10 @@ impl SyncOrchestrator {
                     error_message: None,
                 })
             }
+            Err(crate::errors::ApiError::TokenRevoked) => {
+                log::warn!("Delta sync detected revoked token");
+                Err(AgentError::Api(crate::errors::ApiError::TokenRevoked))
+            }
             Err(e) => {
                 log::error!("Delta sync push failed: {}", redact(&e.to_string()));
                 Ok(SyncResult {
