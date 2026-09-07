@@ -22,6 +22,15 @@ static CUSTOMER_NAME_PATTERN: Lazy<Regex> = Lazy::new(|| {
         .expect("name regex")
 });
 
+static GSTIN_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}\b")
+        .expect("gstin regex")
+});
+
+static PAN_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b").expect("pan regex")
+});
+
 /// Redact sensitive content from a log message before writing.
 pub fn redact(message: &str) -> String {
     let mut out = message.to_string();
@@ -35,6 +44,8 @@ pub fn redact(message: &str) -> String {
     out = CUSTOMER_NAME_PATTERN
         .replace_all(&out, "$1[REDACTED_NAME]")
         .to_string();
+    out = GSTIN_PATTERN.replace_all(&out, "[REDACTED_GSTIN]").to_string();
+    out = PAN_PATTERN.replace_all(&out, "[REDACTED_PAN]").to_string();
     out
 }
 
@@ -69,5 +80,15 @@ mod tests {
         let result = redact(line);
         assert!(!result.contains("Accounts Receivable"));
         assert!(!result.contains("12345.67"));
+    }
+
+    #[test]
+    fn redacts_gstin_and_pan() {
+        let line = "GSTIN: 27ABCDE1234F1Z5, PAN: ABCDE1234F";
+        let result = redact(line);
+        assert!(!result.contains("27ABCDE1234F1Z5"));
+        assert!(!result.contains("ABCDE1234F"));
+        assert!(result.contains("[REDACTED_GSTIN]"));
+        assert!(result.contains("[REDACTED_PAN]"));
     }
 }

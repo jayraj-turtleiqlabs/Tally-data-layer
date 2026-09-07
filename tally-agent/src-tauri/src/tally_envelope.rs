@@ -18,6 +18,9 @@ pub enum ExportReport {
     Groups,
     Vouchers,
     DeltaCollection,
+    CustomLedgers,
+    CustomVouchers,
+    CustomDeltaCollection,
 }
 
 /// A fully-built Tally XML request envelope (always Export).
@@ -28,16 +31,78 @@ pub struct ExportEnvelope {
     pub xml: String,
 }
 
+pub const TDL_CUSTOM_VOUCHERS_REPORT: &str = r#"          <REPORT NAME="FinInsightVoucherReport">
+            <FORMS>FinInsightVoucherForm</FORMS>
+          </REPORT>
+          <FORM NAME="FinInsightVoucherForm">
+            <PARTS>FinInsightVoucherPart</PARTS>
+          </FORM>
+          <PART NAME="FinInsightVoucherPart">
+            <LINES>FinInsightVoucherLine</LINES>
+            <REPEAT>FinInsightVoucherLine : FinInsightVoucherColl</REPEAT>
+            <SCROLLED>Vertical</SCROLLED>
+          </PART>
+          <LINE NAME="FinInsightVoucherLine">
+            <FIELDS>FldVoucherNumber, FldVoucherType, FldDate, FldAlterId, FldAmount, FldPartyName</FIELDS>
+          </LINE>
+          <FIELD NAME="FldVoucherNumber">
+            <SET>$VoucherNumber</SET>
+            <XMLTAG>VOUCHERNUMBER</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldVoucherType">
+            <SET>$VoucherTypeName</SET>
+            <XMLTAG>VOUCHERTYPENAME</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldDate">
+            <SET>$Date</SET>
+            <XMLTAG>DATE</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldAlterId">
+            <SET>$AlterID</SET>
+            <XMLTAG>ALTERID</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldAmount">
+            <SET>$Amount</SET>
+            <XMLTAG>AMOUNT</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldPartyName">
+            <SET>if $$IsEmpty:$PartyLedgerName then $PartyName else $PartyLedgerName</SET>
+            <XMLTAG>PARTYLEDGERNAME</XMLTAG>
+          </FIELD>"#;
+
+pub const TDL_CUSTOM_LEDGERS_REPORT: &str = r#"          <REPORT NAME="FinInsightLedgerReport">
+            <FORMS>FinInsightLedgerForm</FORMS>
+          </REPORT>
+          <FORM NAME="FinInsightLedgerForm">
+            <PARTS>FinInsightLedgerPart</PARTS>
+          </FORM>
+          <PART NAME="FinInsightLedgerPart">
+            <LINES>FinInsightLedgerLine</LINES>
+            <REPEAT>FinInsightLedgerLine : FinInsightLedgerColl</REPEAT>
+            <SCROLLED>Vertical</SCROLLED>
+          </PART>
+          <LINE NAME="FinInsightLedgerLine">
+            <FIELDS>FldLedgerName, FldParent, FldAlterId, FldOpeningBalance</FIELDS>
+          </LINE>
+          <FIELD NAME="FldLedgerName">
+            <SET>$Name</SET>
+            <XMLTAG>NAME</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldParent">
+            <SET>$Parent</SET>
+            <XMLTAG>PARENT</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldAlterId">
+            <SET>$AlterID</SET>
+            <XMLTAG>ALTERID</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldOpeningBalance">
+            <SET>$OpeningBalance</SET>
+            <XMLTAG>OPENINGBALANCE</XMLTAG>
+          </FIELD>"#;
+
 impl ExportEnvelope {
     pub fn build(report: ExportReport, alter_id_from: Option<u64>) -> Self {
-        let (collection_name, entity_type, fetch_fields) = match report {
-            ExportReport::CompanyInfo => ("Collection of Companies", "Company", "NAME, ALTERID"),
-            ExportReport::Ledgers => ("Ledgers", "Ledger", "NAME, PARENT, ALTERID, OPENINGBALANCE"),
-            ExportReport::Groups => ("Groups", "Group", "NAME, PARENT, ALTERID"),
-            ExportReport::Vouchers => ("Vouchers", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT"),
-            ExportReport::DeltaCollection => ("AlterIds", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT"),
-        };
-
         let (filter_element, system_formula) = match alter_id_from {
             Some(id) => (
                 "\n            <FILTERS>AlterIdFilter</FILTERS>".to_string(),
@@ -46,8 +111,81 @@ impl ExportEnvelope {
             None => (String::new(), String::new()),
         };
 
-        let xml = format!(
-            r#"<ENVELOPE>
+        let xml = match report {
+            ExportReport::CustomVouchers | ExportReport::CustomDeltaCollection => {
+                let report_name = match report {
+                    ExportReport::CustomVouchers => "FinInsightVoucherReport",
+                    ExportReport::CustomDeltaCollection => "FinInsightDeltaVoucherReport",
+                    _ => unreachable!(),
+                };
+                let coll_name = "FinInsightVoucherColl";
+                format!(
+                    r#"<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Report</TYPE>
+    <ID>{report_name}</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+{TDL_CUSTOM_VOUCHERS_REPORT}
+          <COLLECTION NAME="{coll_name}">
+            <TYPE>Voucher</TYPE>{filter_element}
+          </COLLECTION>{system_formula}
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>"#
+                )
+            }
+            ExportReport::CustomLedgers => {
+                let report_name = "FinInsightLedgerReport";
+                let coll_name = "FinInsightLedgerColl";
+                format!(
+                    r#"<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Report</TYPE>
+    <ID>{report_name}</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+{TDL_CUSTOM_LEDGERS_REPORT}
+          <COLLECTION NAME="{coll_name}">
+            <TYPE>Ledger</TYPE>{filter_element}
+          </COLLECTION>{system_formula}
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>"#
+                )
+            }
+            _ => {
+                let (collection_name, entity_type, fetch_fields) = match report {
+                    ExportReport::CompanyInfo => ("Collection of Companies", "Company", "NAME, ALTERID"),
+                    ExportReport::Ledgers => ("Ledgers", "Ledger", "NAME, PARENT, ALTERID, OPENINGBALANCE"),
+                    ExportReport::Groups => ("Groups", "Group", "NAME, PARENT, ALTERID"),
+                    ExportReport::Vouchers => ("Vouchers", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT, PARTYLEDGERNAME, PARTYNAME"),
+                    ExportReport::DeltaCollection => ("AlterIds", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT, PARTYLEDGERNAME, PARTYNAME"),
+                    _ => unreachable!(),
+                };
+
+                format!(
+                    r#"<ENVELOPE>
   <HEADER>
     <VERSION>1</VERSION>
     <TALLYREQUEST>Export</TALLYREQUEST>
@@ -70,7 +208,9 @@ impl ExportEnvelope {
     </DESC>
   </BODY>
 </ENVELOPE>"#
-        );
+                )
+            }
+        };
 
         Self {
             direction: EnvelopeDirection::Export,
@@ -105,6 +245,9 @@ mod tests {
             ExportReport::Groups,
             ExportReport::Vouchers,
             ExportReport::DeltaCollection,
+            ExportReport::CustomLedgers,
+            ExportReport::CustomVouchers,
+            ExportReport::CustomDeltaCollection,
         ] {
             let env = ExportEnvelope::build(report, Some(100));
             assert!(
@@ -118,6 +261,40 @@ mod tests {
                 report
             );
         }
+    }
+
+    #[test]
+    fn custom_vouchers_envelope_contains_inline_tdl() {
+        let env = ExportEnvelope::build(ExportReport::CustomVouchers, None);
+        assert!(env.xml.contains("<TYPE>Report</TYPE>"));
+        assert!(env.xml.contains("<ID>FinInsightVoucherReport</ID>"));
+        assert!(env.xml.contains("<REPORT NAME=\"FinInsightVoucherReport\">"));
+        assert!(env.xml.contains("<FIELD NAME=\"FldVoucherNumber\">"));
+        assert!(env.xml.contains("<XMLTAG>VOUCHERNUMBER</XMLTAG>"));
+        assert!(env.xml.contains("<FIELD NAME=\"FldPartyName\">"));
+        assert!(env.xml.contains("<XMLTAG>PARTYLEDGERNAME</XMLTAG>"));
+        assert!(env.xml.contains("<COLLECTION NAME=\"FinInsightVoucherColl\">"));
+        assert!(!env.xml.to_ascii_lowercase().contains("import"));
+    }
+
+    #[test]
+    fn custom_ledgers_envelope_contains_inline_tdl() {
+        let env = ExportEnvelope::build(ExportReport::CustomLedgers, None);
+        assert!(env.xml.contains("<TYPE>Report</TYPE>"));
+        assert!(env.xml.contains("<ID>FinInsightLedgerReport</ID>"));
+        assert!(env.xml.contains("<REPORT NAME=\"FinInsightLedgerReport\">"));
+        assert!(env.xml.contains("<FIELD NAME=\"FldLedgerName\">"));
+        assert!(env.xml.contains("<XMLTAG>NAME</XMLTAG>"));
+        assert!(env.xml.contains("<COLLECTION NAME=\"FinInsightLedgerColl\">"));
+    }
+
+    #[test]
+    fn custom_delta_envelope_contains_filter_and_formula() {
+        let env = ExportEnvelope::build(ExportReport::CustomDeltaCollection, Some(500));
+        assert!(env.xml.contains("<TYPE>Report</TYPE>"));
+        assert!(env.xml.contains("<ID>FinInsightDeltaVoucherReport</ID>"));
+        assert!(env.xml.contains("<FILTERS>AlterIdFilter</FILTERS>"));
+        assert!(env.xml.contains(r#"<SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterID &gt; 500</SYSTEM>"#));
     }
 
     #[test]

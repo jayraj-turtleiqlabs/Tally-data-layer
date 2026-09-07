@@ -51,6 +51,15 @@ fn validate_loopback(host: &str) -> Result<(), TallyError> {
     }
 }
 
+pub fn is_tally_error_response(xml: &str) -> bool {
+    let lower = xml.to_ascii_lowercase();
+    lower.contains("<lineerror>")
+        || lower.contains("<error>")
+        || lower.contains("error in tdl")
+        || lower.contains("tdl error")
+        || lower.contains("<status>0</status>")
+}
+
 pub struct TallyClient {
     endpoint: TallyEndpoint,
     http: Client,
@@ -89,27 +98,84 @@ impl TallyClient {
     }
 
     pub async fn export_ledgers(&self) -> Result<Vec<LedgerRecord>, TallyError> {
-        let envelope = ExportEnvelope::build(ExportReport::Ledgers, None);
+        // 1. Try lean custom TDL report
+        let custom_env = ExportEnvelope::build(ExportReport::CustomLedgers, None);
+        match self.send_export(&custom_env, self.export_timeout.as_secs()).await {
+            Ok(xml) if !is_tally_error_response(&xml) => {
+                let adapter = adapter_for_xml(&xml);
+                if let Ok(records) = adapter.parse_ledgers(&xml) {
+                    return Ok(records);
+                }
+                log::warn!("Custom TDL ledger export failed to parse; falling back to default export");
+            }
+            Ok(_) => {
+                log::warn!("Custom TDL ledger export returned error response; falling back to default export");
+            }
+            Err(e) => {
+                log::warn!("Custom TDL ledger export request failed: {}; falling back to default export", e);
+            }
+        }
+
+        // 2. Fallback to default export
+        let default_env = ExportEnvelope::build(ExportReport::Ledgers, None);
         let xml = self
-            .send_export(&envelope, self.export_timeout.as_secs())
+            .send_export(&default_env, self.export_timeout.as_secs())
             .await?;
         let adapter = adapter_for_xml(&xml);
         adapter.parse_ledgers(&xml)
     }
 
     pub async fn export_vouchers(&self) -> Result<Vec<VoucherRecord>, TallyError> {
-        let envelope = ExportEnvelope::build(ExportReport::Vouchers, None);
+        // 1. Try lean custom TDL report
+        let custom_env = ExportEnvelope::build(ExportReport::CustomVouchers, None);
+        match self.send_export(&custom_env, self.export_timeout.as_secs()).await {
+            Ok(xml) if !is_tally_error_response(&xml) => {
+                let adapter = adapter_for_xml(&xml);
+                if let Ok(records) = adapter.parse_vouchers(&xml) {
+                    return Ok(records);
+                }
+                log::warn!("Custom TDL voucher export failed to parse; falling back to default export");
+            }
+            Ok(_) => {
+                log::warn!("Custom TDL voucher export returned error response; falling back to default export");
+            }
+            Err(e) => {
+                log::warn!("Custom TDL voucher export request failed: {}; falling back to default export", e);
+            }
+        }
+
+        // 2. Fallback to default export
+        let default_env = ExportEnvelope::build(ExportReport::Vouchers, None);
         let xml = self
-            .send_export(&envelope, self.export_timeout.as_secs())
+            .send_export(&default_env, self.export_timeout.as_secs())
             .await?;
         let adapter = adapter_for_xml(&xml);
         adapter.parse_vouchers(&xml)
     }
 
     pub async fn export_delta(&self, after_alter_id: u64) -> Result<Vec<DeltaRecord>, TallyError> {
-        let envelope = ExportEnvelope::build(ExportReport::DeltaCollection, Some(after_alter_id));
+        // 1. Try lean custom TDL report
+        let custom_env = ExportEnvelope::build(ExportReport::CustomDeltaCollection, Some(after_alter_id));
+        match self.send_export(&custom_env, self.export_timeout.as_secs()).await {
+            Ok(xml) if !is_tally_error_response(&xml) => {
+                let adapter = adapter_for_xml(&xml);
+                if let Ok(records) = adapter.parse_delta_records(&xml) {
+                    return Ok(records);
+                }
+                log::warn!("Custom TDL delta export failed to parse; falling back to default export");
+            }
+            Ok(_) => {
+                log::warn!("Custom TDL delta export returned error response; falling back to default export");
+            }
+            Err(e) => {
+                log::warn!("Custom TDL delta export request failed: {}; falling back to default export", e);
+            }
+        }
+
+        // 2. Fallback to default export
+        let default_env = ExportEnvelope::build(ExportReport::DeltaCollection, Some(after_alter_id));
         let xml = self
-            .send_export(&envelope, self.export_timeout.as_secs())
+            .send_export(&default_env, self.export_timeout.as_secs())
             .await?;
         let adapter = adapter_for_xml(&xml);
         adapter.parse_delta_records(&xml)
@@ -172,5 +238,12 @@ mod tests {
         let env = ExportEnvelope::ping();
         assert!(env.xml.contains("Export"));
         assert!(!env.xml.to_ascii_lowercase().contains("import"));
+    }
+
+    #[test]
+    fn detects_tally_error_responses() {
+        assert!(is_tally_error_response("<RESPONSE><LINEERROR>Error in TDL: Unknown Report</LINEERROR></RESPONSE>"));
+        assert!(is_tally_error_response("<ENVELOPE><HEADER><STATUS>0</STATUS></HEADER><BODY><ERROR>Failed</ERROR></BODY></ENVELOPE>"));
+        assert!(!is_tally_error_response("<ENVELOPE><BODY><DATA><COLLECTION></COLLECTION></DATA></BODY></ENVELOPE>"));
     }
 }

@@ -93,6 +93,7 @@ async fn retry_after_failure_sync_orchestrator() {
     <VOUCHER>
       <VOUCHERNUMBER>INV-001</VOUCHERNUMBER>
       <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <PARTYLEDGERNAME>Aarav Textiles</PARTYLEDGERNAME>
       <DATE>20260401</DATE>
       <ALTERID>150</ALTERID>
       <AMOUNT>25000.00</AMOUNT>

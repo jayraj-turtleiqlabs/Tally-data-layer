@@ -312,10 +312,18 @@ impl CloudClient {
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
         let status = resp.status();
-        println!("[cloud_client] Initial batch {}/{} response HTTP {}", batch.batch_index + 1, batch.total_batches, status);
+        println!(
+            "[cloud_client] Initial batch {}/{} response HTTP {}",
+            batch.batch_index + 1,
+            batch.total_batches,
+            status
+        );
 
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            log::warn!("Initial batch push returned HTTP {} - token revoked or unauthorized", status);
+            log::warn!(
+                "Initial batch push returned HTTP {} - token revoked or unauthorized",
+                status
+            );
             return Err(ApiError::TokenRevoked);
         }
 
@@ -343,7 +351,10 @@ impl CloudClient {
         println!("[cloud_client] Delta sync response HTTP {}", status);
 
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            log::warn!("Delta sync push returned HTTP {} - token revoked or unauthorized", status);
+            log::warn!(
+                "Delta sync push returned HTTP {} - token revoked or unauthorized",
+                status
+            );
             return Err(ApiError::TokenRevoked);
         }
 

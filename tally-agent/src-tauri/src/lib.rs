@@ -157,11 +157,10 @@ impl AgentState {
             let tally = TallyClient::new(endpoint)?;
             let cloud = self.new_cloud_client()?.with_token(token);
             let mut orch = self.orchestrator.lock().await;
-            *orch = Some(SyncOrchestrator::new(
-                tally,
-                cloud,
-                self.checkpoint_store.clone(),
-            ));
+            *orch = Some(
+                SyncOrchestrator::new(tally, cloud, self.checkpoint_store.clone())
+                    .with_expected_company(Some(company_name.to_string())),
+            );
         }
 
         println!("[pair] Running initial backfill...");
@@ -369,11 +368,28 @@ impl AgentState {
                     status.last_error = None;
                 }
                 Ok(r) => {
-                    status.last_error = r.error_message.clone().or_else(|| Some("Sync failed. Please try again.".into()));
+                    status.last_error = r.error_message.clone().or_else(|| Some("Sync completed with issues.".into()));
                 }
                 Err(e) => {
-                    status.last_error = Some("Sync failed. Please try again.".into());
-                    let _ = e;
+                    let err_msg = match e {
+                        AgentError::Tally(crate::errors::TallyError::ConnectionRefused(_)) => {
+                            format!("Tally is not reachable on port {}. Please ensure Tally is running.", self.tally_port)
+                        }
+                        AgentError::Tally(crate::errors::TallyError::NoActiveCompany) => {
+                            "No company is currently open in Tally. Please open your company in Tally.".into()
+                        }
+                        AgentError::Tally(crate::errors::TallyError::CompanyMismatch { current, expected }) => {
+                            format!("Active company in Tally ('{}') does not match paired company ('{}').", current, expected)
+                        }
+                        AgentError::Api(ApiError::Network(net_err)) => {
+                            format!("Network unreachable: {}. Please check your internet connection.", net_err)
+                        }
+                        AgentError::Api(ApiError::TokenRevoked) => {
+                            "Agent authorization was revoked or expired. Please re-pair.".into()
+                        }
+                        other => format!("{}", other),
+                    };
+                    status.last_error = Some(err_msg);
                 }
             }
         }

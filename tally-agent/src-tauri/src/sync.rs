@@ -13,11 +13,70 @@ use crate::tally_client::TallyClient;
 
 pub const DEFAULT_BATCH_SIZE: usize = 500;
 
+/// Data quality issue detected during pre-push inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityIssue {
+    pub entity_type: &'static str,
+    pub alter_id: u64,
+    pub issue: String,
+}
+
+pub fn check_voucher_quality(v: &crate::tally_schema::VoucherRecord) -> Option<QualityIssue> {
+    if v.voucher_number.trim().is_empty() {
+        return Some(QualityIssue {
+            entity_type: "voucher",
+            alter_id: v.alter_id,
+            issue: "Missing or empty voucher number".to_string(),
+        });
+    }
+    let date_str = v.date.trim();
+    if date_str.is_empty() || date_str == "00000000" || date_str.len() < 8 {
+        return Some(QualityIssue {
+            entity_type: "voucher",
+            alter_id: v.alter_id,
+            issue: format!("Invalid voucher date: '{}'", v.date),
+        });
+    }
+    if let Some(amt) = v.amount {
+        if amt < 0.0 && (v.voucher_type.eq_ignore_ascii_case("Sales") || v.voucher_type.eq_ignore_ascii_case("Receipt")) {
+            return Some(QualityIssue {
+                entity_type: "voucher",
+                alter_id: v.alter_id,
+                issue: format!("Negative amount {} for positive voucher type '{}'", amt, v.voucher_type),
+            });
+        }
+    }
+    if v.voucher_type.eq_ignore_ascii_case("Sales") {
+        if let Some(ref party) = v.party_name {
+            if party.trim().is_empty() {
+                return Some(QualityIssue {
+                    entity_type: "voucher",
+                    alter_id: v.alter_id,
+                    issue: "Empty party name for Sales voucher".to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+pub fn check_ledger_quality(l: &crate::tally_schema::LedgerRecord) -> Option<QualityIssue> {
+    if l.name.trim().is_empty() {
+        return Some(QualityIssue {
+            entity_type: "ledger",
+            alter_id: l.alter_id,
+            issue: "Missing or empty ledger name".to_string(),
+        });
+    }
+    None
+}
+
 pub struct SyncOrchestrator {
     tally: TallyClient,
     cloud: CloudClient,
     checkpoint_store: CheckpointStore,
     batch_size: usize,
+    expected_company: Option<String>,
     sync_in_progress: Arc<AtomicBool>,
 }
 
@@ -40,12 +99,18 @@ impl SyncOrchestrator {
             cloud,
             checkpoint_store,
             batch_size: DEFAULT_BATCH_SIZE,
+            expected_company: None,
             sync_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size.max(1);
+        self
+    }
+
+    pub fn with_expected_company(mut self, company: Option<String>) -> Self {
+        self.expected_company = company;
         self
     }
 
@@ -77,8 +142,34 @@ impl SyncOrchestrator {
         log::info!("Starting initial backfill");
 
         let company = self.tally.ping().await?;
+        if let Some(ref expected) = self.expected_company {
+            if !expected.is_empty() && !company.company_name.eq_ignore_ascii_case(expected) {
+                log::warn!(
+                    "Tally active company '{}' does not match paired company '{}'",
+                    company.company_name,
+                    expected
+                );
+                return Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch {
+                    current: company.company_name,
+                    expected: expected.clone(),
+                }));
+            }
+        }
+
         let ledgers = self.tally.export_ledgers().await?;
         let vouchers = self.tally.export_vouchers().await?;
+
+        // Data quality pre-checks
+        for l in &ledgers {
+            if let Some(issue) = check_ledger_quality(l) {
+                log::warn!("[Data Quality] Ledger warning: {}", issue.issue);
+            }
+        }
+        for v in &vouchers {
+            if let Some(issue) = check_voucher_quality(v) {
+                log::warn!("[Data Quality] Voucher warning: {}", issue.issue);
+            }
+        }
 
         let mut all_records: Vec<(String, serde_json::Value, u64)> = Vec::new();
 
@@ -163,6 +254,21 @@ impl SyncOrchestrator {
         let checkpoint = self.checkpoint_store.load()?;
         if !checkpoint.backfill_complete {
             return Err(AgentError::BackfillRequired);
+        }
+
+        if let Some(ref expected) = self.expected_company {
+            let company = self.tally.ping().await?;
+            if !expected.is_empty() && !company.company_name.eq_ignore_ascii_case(expected) {
+                log::warn!(
+                    "Tally active company '{}' does not match paired company '{}'",
+                    company.company_name,
+                    expected
+                );
+                return Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch {
+                    current: company.company_name,
+                    expected: expected.clone(),
+                }));
+            }
         }
 
         let last_known = checkpoint.last_known_alter_id;
@@ -252,5 +358,121 @@ mod tests {
 
         let cp_after = store.load().unwrap();
         assert_eq!(cp_before.last_known_alter_id, cp_after.last_known_alter_id);
+    }
+
+    #[test]
+    fn test_data_quality_voucher_checks() {
+        let valid_vch = crate::tally_schema::VoucherRecord {
+            voucher_number: "INV-101".into(),
+            voucher_type: "Sales".into(),
+            date: "20260401".into(),
+            alter_id: 100,
+            amount: Some(5000.0),
+            party_name: Some("Aarav Textiles".into()),
+            party_ledger_name: Some("Aarav Textiles".into()),
+        };
+        assert_eq!(check_voucher_quality(&valid_vch), None);
+
+        let empty_num_vch = crate::tally_schema::VoucherRecord {
+            voucher_number: "   ".into(),
+            voucher_type: "Sales".into(),
+            date: "20260401".into(),
+            alter_id: 101,
+            amount: Some(5000.0),
+            party_name: Some("Aarav Textiles".into()),
+            party_ledger_name: Some("Aarav Textiles".into()),
+        };
+        assert!(check_voucher_quality(&empty_num_vch).is_some());
+
+        let invalid_date_vch = crate::tally_schema::VoucherRecord {
+            voucher_number: "INV-102".into(),
+            voucher_type: "Sales".into(),
+            date: "00000000".into(),
+            alter_id: 102,
+            amount: Some(5000.0),
+            party_name: Some("Aarav Textiles".into()),
+            party_ledger_name: Some("Aarav Textiles".into()),
+        };
+        assert!(check_voucher_quality(&invalid_date_vch).is_some());
+
+        let negative_sales_vch = crate::tally_schema::VoucherRecord {
+            voucher_number: "INV-103".into(),
+            voucher_type: "Sales".into(),
+            date: "20260401".into(),
+            alter_id: 103,
+            amount: Some(-5000.0),
+            party_name: Some("Aarav Textiles".into()),
+            party_ledger_name: Some("Aarav Textiles".into()),
+        };
+        assert!(check_voucher_quality(&negative_sales_vch).is_some());
+
+        let empty_party_sales_vch = crate::tally_schema::VoucherRecord {
+            voucher_number: "INV-104".into(),
+            voucher_type: "Sales".into(),
+            date: "20260401".into(),
+            alter_id: 104,
+            amount: Some(5000.0),
+            party_name: Some("   ".into()),
+            party_ledger_name: Some("   ".into()),
+        };
+        assert!(check_voucher_quality(&empty_party_sales_vch).is_some());
+    }
+
+    #[test]
+    fn test_data_quality_ledger_checks() {
+        let valid_l = crate::tally_schema::LedgerRecord {
+            name: "HDFC Bank".into(),
+            parent: "Bank Accounts".into(),
+            alter_id: 50,
+            opening_balance: Some(10000.0),
+        };
+        assert_eq!(check_ledger_quality(&valid_l), None);
+
+        let empty_name_l = crate::tally_schema::LedgerRecord {
+            name: "  ".into(),
+            parent: "Bank Accounts".into(),
+            alter_id: 51,
+            opening_balance: Some(10000.0),
+        };
+        assert!(check_ledger_quality(&empty_name_l).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_company_mismatch_prevents_sync() {
+        let server = wiremock::MockServer::start().await;
+        let port = server.address().port();
+        let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+        <COMPANY><NAME>Different Company Ltd</NAME><ALTERID>50</ALTERID></COMPANY>
+        </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(tally_xml))
+            .mount(&server)
+            .await;
+
+        let endpoint = TallyEndpoint::new("127.0.0.1", port).unwrap();
+        let tally = TallyClient::new(endpoint).unwrap();
+        let cloud = CloudClient::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path().join("cp.json"));
+        store
+            .save(&Checkpoint {
+                backfill_complete: true,
+                last_known_alter_id: 10,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let orch = SyncOrchestrator::new(tally, cloud, store)
+            .with_expected_company(Some("Acme Corp".into()));
+
+        let result = orch.run_delta_sync().await;
+        match result {
+            Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch { current, expected })) => {
+                assert_eq!(current, "Different Company Ltd");
+                assert_eq!(expected, "Acme Corp");
+            }
+            other => panic!("Expected CompanyMismatch error, got {:?}", other),
+        }
     }
 }

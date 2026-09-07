@@ -25,6 +25,9 @@ pub enum TallyError {
 
     #[error("Missing ALTERID in Tally response")]
     MissingAlterId,
+
+    #[error("Tally active company '{current}' does not match paired company '{expected}'")]
+    CompanyMismatch { current: String, expected: String },
 }
 
 #[derive(Debug, Error)]

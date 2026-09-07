@@ -43,6 +43,10 @@ pub struct VoucherRecord {
     pub date: String,
     pub alter_id: u64,
     pub amount: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party_ledger_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -184,6 +188,14 @@ fn parse_company_info_common(xml: &str) -> Result<CompanyInfo, TallyError> {
     })
 }
 
+fn is_ledger_tag(tag_name: &str, expected_tag: &str) -> bool {
+    let upper = tag_name.to_ascii_uppercase();
+    upper == expected_tag.to_ascii_uppercase()
+        || upper == "FININSIGHTLEDGERLINE"
+        || upper.ends_with("LEDGERLINE")
+        || upper == "CUSTOMLEDGER"
+}
+
 fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, TallyError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -201,7 +213,7 @@ fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, Tally
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag_name == tag {
+                if is_ledger_tag(&tag_name, tag) {
                     in_ledger = true;
                     name.clear();
                     parent.clear();
@@ -215,7 +227,7 @@ fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, Tally
             }
             Ok(Event::End(e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag_name == tag && in_ledger {
+                if is_ledger_tag(&tag_name, tag) && in_ledger {
                     if !name.is_empty() {
                         records.push(LedgerRecord {
                             name: name.clone(),
@@ -231,8 +243,8 @@ fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, Tally
                 let text = e.unescape().map_err(|_| {
                     TallyError::MalformedXml("invalid text encoding".into())
                 })?;
-                match current_tag.as_str() {
-                    "NAME" => name = text.to_string(),
+                match current_tag.to_ascii_uppercase().as_str() {
+                    "NAME" | "LEDGERNAME" => name = text.to_string(),
                     "PARENT" => parent = text.to_string(),
                     "ALTERID" => {
                         alter_id = text.trim().parse().unwrap_or(0);
@@ -259,7 +271,7 @@ fn attribute_value(
 ) -> Result<Option<String>, TallyError> {
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|e| TallyError::MalformedXml(e.to_string()))?;
-        if attribute.key.as_ref() == key.as_bytes() {
+        if attribute.key.as_ref().eq_ignore_ascii_case(key.as_bytes()) {
             let value = attribute
                 .unescape_value()
                 .map_err(|e| TallyError::MalformedXml(e.to_string()))?;
@@ -267,6 +279,14 @@ fn attribute_value(
         }
     }
     Ok(None)
+}
+
+fn is_voucher_tag(tag_name: &str, expected_tag: &str) -> bool {
+    let upper = tag_name.to_ascii_uppercase();
+    upper == expected_tag.to_ascii_uppercase()
+        || upper == "FININSIGHTVOUCHERLINE"
+        || upper.ends_with("VOUCHERLINE")
+        || upper == "CUSTOMVOUCHER"
 }
 
 fn parse_vouchers_common(xml: &str, tag: &str) -> Result<Vec<VoucherRecord>, TallyError> {
@@ -282,30 +302,34 @@ fn parse_vouchers_common(xml: &str, tag: &str) -> Result<Vec<VoucherRecord>, Tal
     let mut date = String::new();
     let mut alter_id = 0u64;
     let mut amount = None;
+    let mut party_name = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag_name == tag {
+                if is_voucher_tag(&tag_name, tag) {
                     in_voucher = true;
                     voucher_number.clear();
                     voucher_type.clear();
                     date.clear();
                     alter_id = 0;
                     amount = None;
+                    party_name = None;
                 }
                 current_tag = tag_name;
             }
             Ok(Event::End(e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag_name == tag && in_voucher {
+                if is_voucher_tag(&tag_name, tag) && in_voucher {
                     records.push(VoucherRecord {
                         voucher_number: voucher_number.clone(),
                         voucher_type: voucher_type.clone(),
                         date: date.clone(),
                         alter_id,
                         amount,
+                        party_name: party_name.clone(),
+                        party_ledger_name: party_name.clone(),
                     });
                     in_voucher = false;
                 }
@@ -314,12 +338,18 @@ fn parse_vouchers_common(xml: &str, tag: &str) -> Result<Vec<VoucherRecord>, Tal
                 let text = e.unescape().map_err(|_| {
                     TallyError::MalformedXml("invalid text encoding".into())
                 })?;
-                match current_tag.as_str() {
+                match current_tag.to_ascii_uppercase().as_str() {
                     "VOUCHERNUMBER" => voucher_number = text.to_string(),
                     "VOUCHERTYPENAME" => voucher_type = text.to_string(),
                     "DATE" => date = text.to_string(),
                     "ALTERID" => alter_id = text.trim().parse().unwrap_or(0),
                     "AMOUNT" => amount = text.trim().parse().ok(),
+                    "PARTYLEDGERNAME" | "PARTYNAME" => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() && party_name.is_none() {
+                            party_name = Some(trimmed.to_string());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -387,5 +417,78 @@ mod tests {
         let ledgers = adapter.parse_ledgers(xml).expect("parse ledgers");
         assert_eq!(ledgers.len(), 2);
         assert_eq!(ledgers[0].name, "Cash");
+    }
+
+    #[test]
+    fn parse_custom_tdl_vouchers_xml() {
+        let xml = r#"<ENVELOPE>
+  <BODY>
+    <DATA>
+      <FININSIGHTVOUCHERREPORT>
+        <FININSIGHTVOUCHERLINE>
+          <VOUCHERNUMBER>INV-1001</VOUCHERNUMBER>
+          <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+          <PARTYLEDGERNAME>Aarav Textiles</PARTYLEDGERNAME>
+          <DATE>20260401</DATE>
+          <ALTERID>1234</ALTERID>
+          <AMOUNT>15000.50</AMOUNT>
+        </FININSIGHTVOUCHERLINE>
+        <FININSIGHTVOUCHERLINE>
+          <VOUCHERNUMBER>INV-1002</VOUCHERNUMBER>
+          <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
+          <PARTYLEDGERNAME>ABC Technologies Pvt Ltd</PARTYLEDGERNAME>
+          <DATE>20260402</DATE>
+          <ALTERID>1235</ALTERID>
+          <AMOUNT>5000.00</AMOUNT>
+        </FININSIGHTVOUCHERLINE>
+      </FININSIGHTVOUCHERREPORT>
+    </DATA>
+  </BODY>
+</ENVELOPE>"#;
+
+        let adapter = PrimeAdapter;
+        let vouchers = adapter.parse_vouchers(xml).expect("parse vouchers");
+        assert_eq!(vouchers.len(), 2);
+        assert_eq!(vouchers[0].voucher_number, "INV-1001");
+        assert_eq!(vouchers[0].voucher_type, "Sales");
+        assert_eq!(vouchers[0].party_name, Some("Aarav Textiles".to_string()));
+        assert_eq!(vouchers[0].party_ledger_name, Some("Aarav Textiles".to_string()));
+        assert_eq!(vouchers[0].date, "20260401");
+        assert_eq!(vouchers[0].alter_id, 1234);
+        assert_eq!(vouchers[0].amount, Some(15000.50));
+
+        assert_eq!(vouchers[1].voucher_number, "INV-1002");
+        assert_eq!(vouchers[1].voucher_type, "Receipt");
+        assert_eq!(vouchers[1].party_name, Some("ABC Technologies Pvt Ltd".to_string()));
+        assert_eq!(vouchers[1].party_ledger_name, Some("ABC Technologies Pvt Ltd".to_string()));
+        assert_eq!(vouchers[1].date, "20260402");
+        assert_eq!(vouchers[1].alter_id, 1235);
+        assert_eq!(vouchers[1].amount, Some(5000.00));
+    }
+
+    #[test]
+    fn parse_custom_tdl_ledgers_xml() {
+        let xml = r#"<ENVELOPE>
+  <BODY>
+    <DATA>
+      <FININSIGHTLEDGERREPORT>
+        <FININSIGHTLEDGERLINE>
+          <NAME>HDFC Bank</NAME>
+          <PARENT>Bank Accounts</PARENT>
+          <ALTERID>990</ALTERID>
+          <OPENINGBALANCE>125000.00</OPENINGBALANCE>
+        </FININSIGHTLEDGERLINE>
+      </FININSIGHTLEDGERREPORT>
+    </DATA>
+  </BODY>
+</ENVELOPE>"#;
+
+        let adapter = Erp9Adapter;
+        let ledgers = adapter.parse_ledgers(xml).expect("parse ledgers");
+        assert_eq!(ledgers.len(), 1);
+        assert_eq!(ledgers[0].name, "HDFC Bank");
+        assert_eq!(ledgers[0].parent, "Bank Accounts");
+        assert_eq!(ledgers[0].alter_id, 990);
+        assert_eq!(ledgers[0].opening_balance, Some(125000.00));
     }
 }
