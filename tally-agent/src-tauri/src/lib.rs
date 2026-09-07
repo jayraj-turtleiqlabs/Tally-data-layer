@@ -140,9 +140,9 @@ impl AgentState {
         token: &str,
         company_name: &str,
     ) -> Result<String, AgentError> {
-        println!("[pair] Storing agent token in vault...");
+        log::debug!("[pair] Storing agent token in vault...");
         Vault::store_token(token)?;
-        println!("[pair] Token stored");
+        log::debug!("[pair] Token stored");
 
         // Reset checkpoint on fresh pairing so a fresh initial backfill is guaranteed
         let _ = self.checkpoint_store.save(&Checkpoint::default());
@@ -167,42 +167,42 @@ impl AgentState {
             );
         }
 
-        println!("[pair] Running initial backfill...");
+        log::info!("[pair] Running initial backfill...");
         // Automatic initial backfill after pairing
         self.run_backfill_internal().await?;
-        println!("[pair] Backfill complete");
+        log::info!("[pair] Backfill complete");
 
         Ok(company_name.to_string())
     }
 
     pub async fn pair(&self, code: &str) -> Result<String, AgentError> {
-        println!("[pair] Step 1: Creating TallyEndpoint on 127.0.0.1:{}", self.tally_port);
+        log::debug!("[pair] Step 1: Creating TallyEndpoint on 127.0.0.1:{}", self.tally_port);
         let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
         let tally = TallyClient::new(endpoint)?;
 
-        println!("[pair] Step 2: Pinging local Tally...");
+        log::debug!("[pair] Step 2: Pinging local Tally...");
         let company = match tally.ping().await {
             Ok(c) => {
-                println!("[pair] Step 2 OK: Tally responded, company='{}'", c.company_name);
+                log::info!("[pair] Step 2 OK: Tally responded, company='{}'", c.company_name);
                 c
             }
             Err(e) => {
-                println!("[pair] Step 2 FAILED: Tally ping error: {:?}", e);
+                log::error!("[pair] Step 2 FAILED: Tally ping error: {:?}", e);
                 return Err(e.into());
             }
         };
 
-        println!("[pair] Step 3: Creating CloudClient...");
+        log::debug!("[pair] Step 3: Creating CloudClient...");
         let cloud = self.new_cloud_client()?;
 
-        println!("[pair] Step 4: Sending pair request to cloud with code='{}'", &code[..code.len().min(4)]);
+        log::debug!("[pair] Step 4: Sending pair request to cloud with code='{}'", &code[..code.len().min(4)]);
         let response = match cloud.pair(code, &company.company_name).await {
             Ok(r) => {
-                println!("[pair] Step 4 OK: Pairing succeeded, got agent_token");
+                log::info!("[pair] Step 4 OK: Pairing succeeded, got agent_token");
                 r
             }
             Err(e) => {
-                println!("[pair] Step 4 FAILED: Cloud pair error: {:?}", e);
+                log::error!("[pair] Step 4 FAILED: Cloud pair error: {:?}", e);
                 return Err(AgentError::Api(crate::errors::ApiError::PairingFailed));
             }
         };
@@ -212,16 +212,16 @@ impl AgentState {
     }
 
     pub async fn start_device_login(&self) -> Result<DeviceAuthPublicSession, AgentError> {
-        println!("[device_login] Step 1: Checking Tally reachable...");
+        log::debug!("[device_login] Step 1: Checking Tally reachable...");
         let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
         let tally = TallyClient::new(endpoint)?;
         let _ = tally.ping().await?;
 
-        println!("[device_login] Step 2: Requesting device authorization session...");
+        log::debug!("[device_login] Step 2: Requesting device authorization session...");
         let cloud = self.new_cloud_client()?;
         let session = crate::device_auth::initiate_device_auth(&cloud).await?;
 
-        println!("[device_login] Step 3: Opening system browser to {}", &session.verification_uri);
+        log::info!("[device_login] Step 3: Opening system browser to {}", &session.verification_uri);
         let browser_opened = opener::open(&session.verification_uri).is_ok();
         if !browser_opened {
             log::warn!("System browser could not be launched automatically");
@@ -252,7 +252,7 @@ impl AgentState {
         let company = tally.ping().await?;
 
         let cloud = self.new_cloud_client()?;
-        println!("[device_login] Step 4: Polling backend for user approval...");
+        log::debug!("[device_login] Step 4: Polling backend for user approval...");
         let status = crate::device_auth::poll_until_complete(&cloud, &session).await?;
 
         // Clear active session
@@ -263,15 +263,15 @@ impl AgentState {
 
         match status {
             crate::device_auth::DeviceAuthStatus::Approved { agent_token, .. } => {
-                println!("[device_login] Step 5: Device approved! Setting up connection...");
+                log::info!("[device_login] Step 5: Device approved! Setting up connection...");
                 self.complete_pairing_with_token(&agent_token, &company.company_name).await
             }
             crate::device_auth::DeviceAuthStatus::Denied => {
-                println!("[device_login] Device authorization was denied");
+                log::warn!("[device_login] Device authorization was denied");
                 Err(AgentError::Api(crate::errors::ApiError::DeviceAuthDenied))
             }
             crate::device_auth::DeviceAuthStatus::Expired => {
-                println!("[device_login] Device authorization expired");
+                log::warn!("[device_login] Device authorization expired");
                 Err(AgentError::Api(crate::errors::ApiError::DeviceAuthExpired))
             }
             _ => Err(AgentError::Api(crate::errors::ApiError::InvalidResponse(

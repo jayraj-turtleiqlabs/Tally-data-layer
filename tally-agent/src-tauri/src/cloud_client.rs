@@ -148,7 +148,6 @@ pub struct CloudClient {
 impl CloudClient {
     pub fn new() -> Result<Self, ApiError> {
         let base = api_base_url();
-        println!("=== FinInsight Agent using API base: {} ===", base);
         log::info!("FinInsight Agent using API base: {}", base);
         let http = Client::builder()
             .build()
@@ -214,7 +213,7 @@ impl CloudClient {
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
-        println!("[cloud_client] Pair response HTTP {}, body: {}", status, text);
+        log::debug!("[cloud_client] Pair response HTTP {}, body: {}", status, redact(&text));
 
         if !status.is_success() {
             log::warn!("Pairing failed with status {}: {}", status, text);
@@ -222,7 +221,7 @@ impl CloudClient {
         }
 
         serde_json::from_str::<PairResponse>(&text).map_err(|e| {
-            println!("[cloud_client] Deserialization error: {} for text: {}", e, text);
+            log::error!("[cloud_client] Deserialization error: {} for text: {}", e, redact(&text));
             ApiError::InvalidResponse(redact(&e.to_string()))
         })
     }
@@ -312,7 +311,7 @@ impl CloudClient {
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
         let status = resp.status();
-        println!(
+        log::debug!(
             "[cloud_client] Initial batch {}/{} response HTTP {}",
             batch.batch_index + 1,
             batch.total_batches,
@@ -329,7 +328,7 @@ impl CloudClient {
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            println!("[cloud_client] Initial batch failed body: {}", body);
+            log::warn!("[cloud_client] Initial batch failed body: {}", redact(&body));
             return Err(ApiError::SyncFailed(status.as_u16()));
         }
         Ok(())
@@ -348,7 +347,7 @@ impl CloudClient {
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
         let status = resp.status();
-        println!("[cloud_client] Delta sync response HTTP {}", status);
+        log::debug!("[cloud_client] Delta sync response HTTP {}", status);
 
         if status.as_u16() == 401 || status.as_u16() == 403 {
             log::warn!(
@@ -360,7 +359,7 @@ impl CloudClient {
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            println!("[cloud_client] Delta sync failed body: {}", body);
+            log::warn!("[cloud_client] Delta sync failed body: {}", redact(&body));
             return Err(ApiError::SyncFailed(status.as_u16()));
         }
         Ok(())

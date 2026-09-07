@@ -35,7 +35,7 @@ async fn pair_agent(
         .await
         .map_err(|e| {
             let msg = format!("{}", e);
-            println!("[pair_agent] Error: {}", msg);
+            log::error!("[pair_agent] Error: {}", msg);
             msg
         })
 }
@@ -49,7 +49,7 @@ async fn initiate_device_login(
         .await
         .map_err(|e| {
             let msg = format!("{}", e);
-            println!("[initiate_device_login] Error: {}", msg);
+            log::error!("[initiate_device_login] Error: {}", msg);
             msg
         })
 }
@@ -63,7 +63,7 @@ async fn poll_device_login(
         .await
         .map_err(|e| {
             let msg = format!("{}", e);
-            println!("[poll_device_login] Error: {}", msg);
+            log::error!("[poll_device_login] Error: {}", msg);
             msg
         })
 }
@@ -85,7 +85,7 @@ async fn login_via_browser(
         .await
         .map_err(|e| {
             let msg = format!("{}", e);
-            println!("[login_via_browser] Error: {}", msg);
+            log::error!("[login_via_browser] Error: {}", msg);
             msg
         })
 }
@@ -117,13 +117,21 @@ async fn show_window(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn main() {
+    let _ = fininsight_tally_agent_lib::logging::init_logging();
+
     let tally_port = std::env::var("TALLY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_TALLY_PORT);
 
+    log::info!(
+        "FinInsight Tally Agent v{} started (Tally port: {})",
+        env!("CARGO_PKG_VERSION"),
+        tally_port
+    );
+
     if let Err(e) = validate_startup_config(tally_port) {
-        eprintln!("{e}");
+        log::error!("{e}");
         std::process::exit(1);
     }
 
@@ -147,8 +155,6 @@ fn main() {
             show_window,
         ])
         .setup(|app| {
-            let _ = fininsight_tally_agent_lib::logging::init_logging();
-
             let show_i = MenuItem::with_id(app, "show", "Show FinInsight Agent", true, None::<&str>)?;
             let sync_i = MenuItem::with_id(app, "sync", "Sync Now", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;

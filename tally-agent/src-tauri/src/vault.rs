@@ -23,11 +23,11 @@ impl Vault {
     }
 
     pub fn store_token(token: &str) -> Result<(), VaultError> {
-        println!("[vault] Storing token...");
+        log::debug!("[vault] Storing token...");
         let mut keyring_ok = false;
         if let Ok(entry) = Self::entry() {
             if let Err(e) = entry.set_password(token) {
-                println!("[vault] Keyring set_password note: {:?}", e);
+                log::debug!("[vault] Keyring set_password note: {:?}", e);
             } else {
                 keyring_ok = true;
             }
@@ -37,13 +37,13 @@ impl Vault {
                 let _ = fs::create_dir_all(parent);
             }
             if let Err(e) = fs::write(&path, token) {
-                println!("[vault] Fallback write note: {:?}", e);
+                log::debug!("[vault] Fallback write note: {:?}", e);
                 if !keyring_ok {
                     return Err(VaultError::Keyring(e.to_string()));
                 }
             }
         }
-        println!("[vault] Token stored successfully");
+        log::debug!("[vault] Token stored successfully");
         Ok(())
     }
 

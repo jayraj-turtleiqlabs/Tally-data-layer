@@ -159,11 +159,6 @@ impl SyncOrchestrator {
         let ledgers = self.tally.export_ledgers().await?;
         let vouchers = self.tally.export_vouchers().await?;
 
-        println!(
-            "[backfill] Extracted {} ledgers and {} vouchers from Tally",
-            ledgers.len(),
-            vouchers.len()
-        );
         log::info!(
             "[backfill] Extracted {} ledgers and {} vouchers from Tally",
             ledgers.len(),
@@ -173,7 +168,6 @@ impl SyncOrchestrator {
         // Guard against false completion: do not advance checkpoint if no accounting data was extracted
         if ledgers.is_empty() && vouchers.is_empty() {
             log::warn!("[backfill] Tally returned 0 ledgers and 0 vouchers. Backfill incomplete.");
-            println!("[backfill] Tally returned 0 ledgers and 0 vouchers. Backfill incomplete.");
             return Ok(SyncResult {
                 success: false,
                 records_pushed: 0,
@@ -225,15 +219,7 @@ impl SyncOrchestrator {
         let total_batches = total.div_ceil(self.batch_size) as u32;
         let mut pushed = 0usize;
 
-        println!(
-            "[backfill] Pushing {} total records (1 company, {} ledgers, {} vouchers, max_alter_id={}) in {} batch(es)...",
-            total,
-            ledgers.len(),
-            vouchers.len(),
-            max_alter_id,
-            total_batches
-        );
-        log::info!(
+        log::debug!(
             "[backfill] Pushing {} total records (1 company, {} ledgers, {} vouchers, max_alter_id={}) in {} batch(es)",
             total,
             ledgers.len(),
@@ -267,14 +253,13 @@ impl SyncOrchestrator {
         self.checkpoint_store
             .advance_on_ack(max_alter_id, true)?;
 
-        println!(
+        log::info!(
             "[backfill] Initial backfill complete: {} records pushed ({} ledgers, {} vouchers). Checkpoint advanced to alter_id={}",
             pushed,
             ledgers.len(),
             vouchers.len(),
             max_alter_id
         );
-        log::info!("Initial backfill complete: {} records (max_alter_id={})", pushed, max_alter_id);
 
         Ok(SyncResult {
             success: true,

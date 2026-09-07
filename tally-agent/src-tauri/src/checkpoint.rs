@@ -57,7 +57,7 @@ impl CheckpointStore {
         let data = match fs::read_to_string(&self.path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[checkpoint] Warning: Failed to read checkpoint file ({e}). Resetting to default.");
+                log::warn!("[checkpoint] Failed to read checkpoint file ({e}). Resetting to default.");
                 let default_cp = Checkpoint::default();
                 let _ = self.save(&default_cp);
                 return Ok(default_cp);
@@ -74,7 +74,7 @@ impl CheckpointStore {
         match serde_json::from_str(trimmed) {
             Ok(cp) => Ok(cp),
             Err(e) => {
-                eprintln!("[checkpoint] Warning: Failed to parse checkpoint JSON ({e}). Resetting to default.");
+                log::warn!("[checkpoint] Failed to parse checkpoint JSON ({e}). Resetting to default.");
                 let default_cp = Checkpoint::default();
                 let _ = self.save(&default_cp);
                 Ok(default_cp)

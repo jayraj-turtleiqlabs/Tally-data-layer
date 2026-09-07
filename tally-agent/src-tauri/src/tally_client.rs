@@ -252,7 +252,7 @@ impl TallyClient {
             .await
             .map_err(|e| TallyError::Transport(e.to_string()))?;
 
-        println!(
+        log::debug!(
             "[tally_raw_xml] report={:?}, status={}, response_length={} bytes\n{}",
             envelope.report,
             status,
