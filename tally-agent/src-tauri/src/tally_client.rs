@@ -103,16 +103,28 @@ impl TallyClient {
         match self.send_export(&custom_env, self.export_timeout.as_secs()).await {
             Ok(xml) if !is_tally_error_response(&xml) => {
                 let adapter = adapter_for_xml(&xml);
-                if let Ok(records) = adapter.parse_ledgers(&xml) {
-                    return Ok(records);
+                match adapter.parse_ledgers(&xml) {
+                    Ok(records) if !records.is_empty() => {
+                        return Ok(records);
+                    }
+                    Ok(_) => {
+                        log::warn!(
+                            "Custom TDL ledger export returned 0 records; falling back to default collection export"
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Custom TDL ledger export parse failed: {}; falling back to default collection export",
+                            e
+                        );
+                    }
                 }
-                log::warn!("Custom TDL ledger export failed to parse; falling back to default export");
             }
             Ok(_) => {
-                log::warn!("Custom TDL ledger export returned error response; falling back to default export");
+                log::warn!("Custom TDL ledger export returned error response; falling back to default collection export");
             }
             Err(e) => {
-                log::warn!("Custom TDL ledger export request failed: {}; falling back to default export", e);
+                log::warn!("Custom TDL ledger export request failed: {}; falling back to default collection export", e);
             }
         }
 
@@ -131,16 +143,28 @@ impl TallyClient {
         match self.send_export(&custom_env, self.export_timeout.as_secs()).await {
             Ok(xml) if !is_tally_error_response(&xml) => {
                 let adapter = adapter_for_xml(&xml);
-                if let Ok(records) = adapter.parse_vouchers(&xml) {
-                    return Ok(records);
+                match adapter.parse_vouchers(&xml) {
+                    Ok(records) if !records.is_empty() => {
+                        return Ok(records);
+                    }
+                    Ok(_) => {
+                        log::warn!(
+                            "Custom TDL voucher export returned 0 records; falling back to default collection export"
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Custom TDL voucher export parse failed: {}; falling back to default collection export",
+                            e
+                        );
+                    }
                 }
-                log::warn!("Custom TDL voucher export failed to parse; falling back to default export");
             }
             Ok(_) => {
-                log::warn!("Custom TDL voucher export returned error response; falling back to default export");
+                log::warn!("Custom TDL voucher export returned error response; falling back to default collection export");
             }
             Err(e) => {
-                log::warn!("Custom TDL voucher export request failed: {}; falling back to default export", e);
+                log::warn!("Custom TDL voucher export request failed: {}; falling back to default collection export", e);
             }
         }
 
@@ -159,10 +183,22 @@ impl TallyClient {
         match self.send_export(&custom_env, self.export_timeout.as_secs()).await {
             Ok(xml) if !is_tally_error_response(&xml) => {
                 let adapter = adapter_for_xml(&xml);
-                if let Ok(records) = adapter.parse_delta_records(&xml) {
-                    return Ok(records);
+                match adapter.parse_delta_records(&xml) {
+                    Ok(records) if !records.is_empty() => {
+                        return Ok(records);
+                    }
+                    Ok(_) => {
+                        log::debug!(
+                            "Custom TDL delta export returned 0 records; trying collection fallback"
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Custom TDL delta export parse failed: {}; falling back to default export",
+                            e
+                        );
+                    }
                 }
-                log::warn!("Custom TDL delta export failed to parse; falling back to default export");
             }
             Ok(_) => {
                 log::warn!("Custom TDL delta export returned error response; falling back to default export");
@@ -206,14 +242,25 @@ impl TallyClient {
                 }
             })?;
 
-        if !response.status().is_success() {
-            return Err(TallyError::HttpError(response.status().as_u16()));
+        let status = response.status();
+        if !status.is_success() {
+            return Err(TallyError::HttpError(status.as_u16()));
         }
 
-        response
+        let body = response
             .text()
             .await
-            .map_err(|e| TallyError::Transport(e.to_string()))
+            .map_err(|e| TallyError::Transport(e.to_string()))?;
+
+        println!(
+            "[tally_raw_xml] report={:?}, status={}, response_length={} bytes\n{}",
+            envelope.report,
+            status,
+            body.len(),
+            body
+        );
+
+        Ok(body)
     }
 }
 

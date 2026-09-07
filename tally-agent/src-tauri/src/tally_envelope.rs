@@ -113,11 +113,7 @@ impl ExportEnvelope {
 
         let xml = match report {
             ExportReport::CustomVouchers | ExportReport::CustomDeltaCollection => {
-                let report_name = match report {
-                    ExportReport::CustomVouchers => "FinInsightVoucherReport",
-                    ExportReport::CustomDeltaCollection => "FinInsightDeltaVoucherReport",
-                    _ => unreachable!(),
-                };
+                let report_name = "FinInsightVoucherReport";
                 let coll_name = "FinInsightVoucherColl";
                 format!(
                     r#"<ENVELOPE>
@@ -292,7 +288,7 @@ mod tests {
     fn custom_delta_envelope_contains_filter_and_formula() {
         let env = ExportEnvelope::build(ExportReport::CustomDeltaCollection, Some(500));
         assert!(env.xml.contains("<TYPE>Report</TYPE>"));
-        assert!(env.xml.contains("<ID>FinInsightDeltaVoucherReport</ID>"));
+        assert!(env.xml.contains("<ID>FinInsightVoucherReport</ID>"));
         assert!(env.xml.contains("<FILTERS>AlterIdFilter</FILTERS>"));
         assert!(env.xml.contains(r#"<SYSTEM TYPE="Formulae" NAME="AlterIdFilter">$AlterID &gt; 500</SYSTEM>"#));
     }

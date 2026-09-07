@@ -159,6 +159,31 @@ impl SyncOrchestrator {
         let ledgers = self.tally.export_ledgers().await?;
         let vouchers = self.tally.export_vouchers().await?;
 
+        println!(
+            "[backfill] Extracted {} ledgers and {} vouchers from Tally",
+            ledgers.len(),
+            vouchers.len()
+        );
+        log::info!(
+            "[backfill] Extracted {} ledgers and {} vouchers from Tally",
+            ledgers.len(),
+            vouchers.len()
+        );
+
+        // Guard against false completion: do not advance checkpoint if no accounting data was extracted
+        if ledgers.is_empty() && vouchers.is_empty() {
+            log::warn!("[backfill] Tally returned 0 ledgers and 0 vouchers. Backfill incomplete.");
+            println!("[backfill] Tally returned 0 ledgers and 0 vouchers. Backfill incomplete.");
+            return Ok(SyncResult {
+                success: false,
+                records_pushed: 0,
+                new_alter_id: None,
+                error_message: Some(
+                    "Tally returned 0 ledgers and 0 vouchers. Please ensure your active company in Tally contains accounting data.".into(),
+                ),
+            });
+        }
+
         // Data quality pre-checks
         for l in &ledgers {
             if let Some(issue) = check_ledger_quality(l) {
@@ -200,6 +225,23 @@ impl SyncOrchestrator {
         let total_batches = total.div_ceil(self.batch_size) as u32;
         let mut pushed = 0usize;
 
+        println!(
+            "[backfill] Pushing {} total records (1 company, {} ledgers, {} vouchers, max_alter_id={}) in {} batch(es)...",
+            total,
+            ledgers.len(),
+            vouchers.len(),
+            max_alter_id,
+            total_batches
+        );
+        log::info!(
+            "[backfill] Pushing {} total records (1 company, {} ledgers, {} vouchers, max_alter_id={}) in {} batch(es)",
+            total,
+            ledgers.len(),
+            vouchers.len(),
+            max_alter_id,
+            total_batches
+        );
+
         for (batch_index, chunk) in all_records.chunks(self.batch_size).enumerate() {
             let entity_type = chunk
                 .first()
@@ -225,7 +267,14 @@ impl SyncOrchestrator {
         self.checkpoint_store
             .advance_on_ack(max_alter_id, true)?;
 
-        log::info!("Initial backfill complete: {} records", pushed);
+        println!(
+            "[backfill] Initial backfill complete: {} records pushed ({} ledgers, {} vouchers). Checkpoint advanced to alter_id={}",
+            pushed,
+            ledgers.len(),
+            vouchers.len(),
+            max_alter_id
+        );
+        log::info!("Initial backfill complete: {} records (max_alter_id={})", pushed, max_alter_id);
 
         Ok(SyncResult {
             success: true,

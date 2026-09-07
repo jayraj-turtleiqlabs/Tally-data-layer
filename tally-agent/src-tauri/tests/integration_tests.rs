@@ -414,3 +414,114 @@ async fn test_token_revocation_on_heartbeat() {
         other => panic!("Expected ApiError::TokenRevoked, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn test_initial_backfill_with_zero_records_does_not_advance_checkpoint() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    // Tally returns company info on ping, but empty collections on ledgers/vouchers
+    let company_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY NAME="Zero Record Corp"><ALTERID>500</ALTERID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    let empty_collection_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION></COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains("Collection of Companies"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(company_xml))
+        .mount(&tally_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_collection_xml))
+        .mount(&tally_server)
+        .await;
+
+    let cloud_server = MockServer::start().await;
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-zero");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store.save(&Checkpoint::default()).unwrap();
+
+    let orch = SyncOrchestrator::new(tally_client, cloud_client, store.clone());
+    let result = orch.run_initial_backfill().await.unwrap();
+
+    // Backfill must be reported as unsuccessful
+    assert!(!result.success);
+    assert_eq!(result.records_pushed, 0);
+
+    // Checkpoint must NOT be marked backfill_complete or advanced
+    let cp = store.load().unwrap();
+    assert!(!cp.backfill_complete);
+    assert_eq!(cp.last_known_alter_id, 0);
+}
+
+#[tokio::test]
+async fn test_initial_backfill_with_partial_ledger_data_advances_checkpoint() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let company_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY NAME="Partial Record Corp"><ALTERID>500</ALTERID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    let ledger_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <LEDGER NAME="Customer A">
+      <PARENT>Sundry Debtors</PARENT>
+      <ALTERID>650</ALTERID>
+      <OPENINGBALANCE>10000.00</OPENINGBALANCE>
+    </LEDGER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    let empty_vouchers_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION></COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains("Collection of Companies"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(company_xml))
+        .mount(&tally_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains("<ID>Ledgers</ID>"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ledger_xml))
+        .mount(&tally_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_vouchers_xml))
+        .mount(&tally_server)
+        .await;
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-partial");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store.save(&Checkpoint::default()).unwrap();
+
+    let orch = SyncOrchestrator::new(tally_client, cloud_client, store.clone());
+    let result = orch.run_initial_backfill().await.unwrap();
+
+    assert!(result.success);
+    assert_eq!(result.records_pushed, 2); // 1 company + 1 ledger
+
+    let cp = store.load().unwrap();
+    assert!(cp.backfill_complete);
+    assert_eq!(cp.last_known_alter_id, 650);
+}

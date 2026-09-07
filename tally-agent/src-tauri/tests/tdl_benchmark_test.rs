@@ -254,3 +254,82 @@ async fn custom_tdl_fast_path_when_supported() {
     assert_eq!(vouchers[0].party_name, Some("Fast Customer".to_string()));
     assert_eq!(vouchers[0].alter_id, 111);
 }
+
+#[tokio::test]
+async fn fallback_to_default_voucher_export_when_custom_tdl_returns_empty_xml() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    // 1. Custom TDL request returns empty DATA container (no error tags, but 0 records)
+    let empty_tdl_xml = r#"<ENVELOPE><HEADER><VERSION>1</VERSION><STATUS>1</STATUS></HEADER><BODY><DATA></DATA></BODY></ENVELOPE>"#;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FinInsightVoucherReport"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_tdl_xml))
+        .expect(1)
+        .mount(&tally_server)
+        .await;
+
+    // 2. Default export fallback returns actual voucher data
+    let default_vouchers_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <VOUCHER>
+      <VOUCHERNUMBER>INV-FALLBACK-02</VOUCHERNUMBER>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <PARTYLEDGERNAME>Fallback Customer 2</PARTYLEDGERNAME>
+      <DATE>20260401</DATE>
+      <ALTERID>1002</ALTERID>
+      <AMOUNT>15000.00</AMOUNT>
+    </VOUCHER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<ID>Vouchers</ID>"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(default_vouchers_xml))
+        .expect(1)
+        .mount(&tally_server)
+        .await;
+
+    let vouchers = tally_client.export_vouchers().await.expect("export vouchers via fallback");
+    assert_eq!(vouchers.len(), 1);
+    assert_eq!(vouchers[0].voucher_number, "INV-FALLBACK-02");
+    assert_eq!(vouchers[0].alter_id, 1002);
+}
+
+#[tokio::test]
+async fn fallback_to_default_ledger_export_when_custom_tdl_returns_empty_xml() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    // 1. Custom TDL request returns empty DATA container (no error tags, but 0 records)
+    let empty_tdl_xml = r#"<ENVELOPE><HEADER><VERSION>1</VERSION><STATUS>1</STATUS></HEADER><BODY><DATA></DATA></BODY></ENVELOPE>"#;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FinInsightLedgerReport"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_tdl_xml))
+        .expect(1)
+        .mount(&tally_server)
+        .await;
+
+    // 2. Default export fallback returns actual ledger data
+    let default_ledgers_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <LEDGER NAME="Sundry Debtors - Client A">
+      <PARENT>Sundry Debtors</PARENT>
+      <ALTERID>2001</ALTERID>
+      <OPENINGBALANCE>50000.00</OPENINGBALANCE>
+    </LEDGER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("<ID>Ledgers</ID>"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(default_ledgers_xml))
+        .expect(1)
+        .mount(&tally_server)
+        .await;
+
+    let ledgers = tally_client.export_ledgers().await.expect("export ledgers via fallback");
+    assert_eq!(ledgers.len(), 1);
+    assert_eq!(ledgers[0].name, "Sundry Debtors - Client A");
+    assert_eq!(ledgers[0].alter_id, 2001);
+}

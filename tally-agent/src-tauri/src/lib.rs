@@ -144,11 +144,15 @@ impl AgentState {
         Vault::store_token(token)?;
         println!("[pair] Token stored");
 
+        // Reset checkpoint on fresh pairing so a fresh initial backfill is guaranteed
+        let _ = self.checkpoint_store.save(&Checkpoint::default());
+
         {
             let mut status = self.status.write().await;
             status.paired = true;
             status.company_name = Some(company_name.to_string());
             status.last_error = None;
+            status.backfill_complete = false;
         }
 
         // Rebuild orchestrator with fresh clients
