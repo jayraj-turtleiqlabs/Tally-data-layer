@@ -208,18 +208,33 @@ impl AgentState {
         };
 
         let token = response.token()?;
+        if let Some(cid) = response.connection_id() {
+            if !cid.trim().is_empty() {
+                if let Err(e) = Vault::store_connection_id(cid.trim()) {
+                    log::warn!("Failed to store connection_id from pair response: {:?}", e);
+                }
+            }
+        }
         self.complete_pairing_with_token(&token, &company.company_name).await
     }
 
     pub async fn start_device_login(&self) -> Result<DeviceAuthPublicSession, AgentError> {
-        log::debug!("[device_login] Step 1: Checking Tally reachable...");
+        log::debug!("[device_login] Step 1: Checking Tally reachable and querying active company...");
         let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
         let tally = TallyClient::new(endpoint)?;
-        let _ = tally.ping().await?;
+        let company = tally.ping().await?;
 
-        log::debug!("[device_login] Step 2: Requesting device authorization session...");
+        if company.company_name.trim().is_empty() {
+            log::warn!("[device_login] Tally is reachable but has no active company");
+            return Err(AgentError::Tally(crate::errors::TallyError::NoActiveCompany));
+        }
+
+        log::debug!(
+            "[device_login] Step 2: Requesting device authorization session for company='{}'...",
+            company.company_name
+        );
         let cloud = self.new_cloud_client()?;
-        let session = crate::device_auth::initiate_device_auth(&cloud).await?;
+        let session = crate::device_auth::initiate_device_auth(&cloud, &company.company_name).await?;
 
         log::info!("[device_login] Step 3: Opening system browser to {}", &session.verification_uri);
         let browser_opened = opener::open(&session.verification_uri).is_ok();
@@ -262,8 +277,13 @@ impl AgentState {
         }
 
         match status {
-            crate::device_auth::DeviceAuthStatus::Approved { agent_token, .. } => {
+            crate::device_auth::DeviceAuthStatus::Approved { agent_token, connection_id } => {
                 log::info!("[device_login] Step 5: Device approved! Setting up connection...");
+                if !connection_id.trim().is_empty() {
+                    if let Err(e) = Vault::store_connection_id(connection_id.trim()) {
+                        log::warn!("Failed to store connection_id from device auth approval: {:?}", e);
+                    }
+                }
                 self.complete_pairing_with_token(&agent_token, &company.company_name).await
             }
             crate::device_auth::DeviceAuthStatus::Denied => {
@@ -292,6 +312,7 @@ impl AgentState {
 
     pub async fn disconnect(&self) -> Result<(), AgentError> {
         Vault::delete_token()?;
+        let _ = Vault::delete_connection_id();
         let _ = self.checkpoint_store.save(&Checkpoint::default());
 
         let mut status = self.status.write().await;
@@ -303,6 +324,8 @@ impl AgentState {
     pub async fn handle_token_revoked(&self) {
         log::warn!("Agent token has been revoked or expired. Clearing credentials and prompting re-pairing.");
         let _ = Vault::delete_token();
+        // NOTE: connection_id is intentionally preserved in the vault across token revocation
+        // to enable direct re-pairing without duplicate connection creation.
         let _ = self.checkpoint_store.save(&Checkpoint::default());
 
         let mut status = self.status.write().await;

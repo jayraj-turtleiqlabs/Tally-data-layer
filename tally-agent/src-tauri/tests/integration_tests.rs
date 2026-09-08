@@ -525,3 +525,244 @@ async fn test_initial_backfill_with_partial_ledger_data_advances_checkpoint() {
     assert!(cp.backfill_complete);
     assert_eq!(cp.last_known_alter_id, 650);
 }
+
+#[tokio::test]
+async fn test_start_device_login_sends_company_name_in_initiate_request() {
+    // 1. Mock Tally
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>50</ALTERID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // 2. Mock Cloud Backend and verify received initiate body
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/initiate"))
+        .and(wiremock::matchers::body_string_contains("Acme Corp Ltd"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-init-123",
+            "user_code": "CODE-123",
+            "verification_uri": "https://app.fininsight.io/device",
+            "expires_in": 300,
+            "interval": 5
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    let session = agent_state.start_device_login().await.unwrap();
+    assert_eq!(session.user_code, "CODE-123");
+    assert_eq!(session.verification_uri, "https://app.fininsight.io/device");
+}
+
+#[tokio::test]
+async fn test_start_device_login_fails_when_tally_unreachable() {
+    let unused_port = 59998;
+    let cloud_server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        unused_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    let result = agent_state.start_device_login().await;
+    assert!(result.is_err(), "Must fail when Tally is unreachable");
+}
+
+#[tokio::test]
+async fn test_start_device_login_fails_when_no_active_company() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let empty_company_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME></NAME><ALTERID>0</ALTERID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_company_xml))
+        .mount(&tally_server)
+        .await;
+
+    let cloud_server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    let result = agent_state.start_device_login().await;
+    assert!(result.is_err(), "Must fail when Tally has no active company");
+}
+
+#[tokio::test]
+async fn test_connection_id_stored_and_survives_token_revocation_for_re_pairing() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::delete_token();
+    let _ = Vault::delete_connection_id();
+
+    // 1. Mock Tally
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>50</ALTERID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // 2. Mock Cloud Backend for initial pairing via poll
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "approved",
+            "agent_token": "token-test-123",
+            "connection_id": "conn-saved-777"
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    // 3. Mock Cloud Backend for delta sync backfill
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    // 4. Mock Cloud Backend for second initiate request (after revocation), verifying previousConnectionId
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/initiate"))
+        .and(wiremock::matchers::body_string_contains("conn-saved-777"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-re-pair",
+            "user_code": "CODE-REPAIR",
+            "verification_uri": "https://app.fininsight.io/device",
+            "expires_in": 300,
+            "interval": 5
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    // Store active session to poll
+    let initial_session = fininsight_tally_agent_lib::device_auth::DeviceAuthSession {
+        device_code: "dev-init".into(),
+        user_code: "USER-INIT".into(),
+        verification_uri: "http://example.com/device".into(),
+        poll_interval_secs: 1,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+    };
+    *agent_state.active_device_session.lock().await = Some(initial_session);
+
+    let company = agent_state.poll_device_login().await.unwrap();
+    assert_eq!(company, "Acme Corp Ltd");
+    assert!(Vault::is_paired());
+    assert_eq!(Vault::get_connection_id().unwrap(), "conn-saved-777");
+
+    // Revoke token
+    agent_state.handle_token_revoked().await;
+    assert!(!Vault::is_paired(), "Token must be cleared upon revocation");
+    assert_eq!(
+        Vault::get_connection_id().unwrap(),
+        "conn-saved-777",
+        "Connection ID must persist across token revocation"
+    );
+
+    // Re-initiate device pairing: verify previousConnectionId is sent to backend
+    let repair_session = agent_state.start_device_login().await.unwrap();
+    assert_eq!(repair_session.user_code, "CODE-REPAIR");
+
+    Vault::delete_token().ok();
+    Vault::delete_connection_id().ok();
+}
+
+#[tokio::test]
+async fn test_fresh_agent_omits_previous_connection_id() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::delete_token();
+    let _ = Vault::delete_connection_id();
+
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Fresh Corp</NAME><ALTERID>10</ALTERID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/initiate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-fresh",
+            "user_code": "CODE-FRESH",
+            "verification_uri": "https://app.fininsight.io/device",
+            "expires_in": 300,
+            "interval": 5
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    let session = agent_state.start_device_login().await.unwrap();
+    assert_eq!(session.user_code, "CODE-FRESH");
+
+    // Confirm nothing in vault
+    assert!(Vault::get_connection_id().is_err());
+}
+
+#[tokio::test]
+async fn test_disconnect_clears_token_and_connection_id() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::store_token("temp-token-123");
+    let _ = Vault::store_connection_id("conn-to-delete-456");
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        9000,
+        None,
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    agent_state.disconnect().await.unwrap();
+    assert!(Vault::get_token().is_err());
+    assert!(Vault::get_connection_id().is_err());
+}

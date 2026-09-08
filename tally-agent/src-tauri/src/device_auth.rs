@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::cloud_client::CloudClient;
 use crate::errors::ApiError;
 use crate::redact::redact;
+use crate::vault::Vault;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceAuthStatus {
@@ -25,12 +26,18 @@ pub struct DeviceAuthSession {
     pub expires_at: Instant,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct DeviceInitiateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "agent_label", rename = "agentLabel")]
+    pub agent_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "company_name", rename = "companyName")]
+    pub company_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "previous_connection_id", rename = "previousConnectionId")]
+    pub previous_connection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,14 +111,45 @@ impl DevicePollResponse {
 }
 
 /// Request a new device authorization session from the cloud backend.
-pub async fn initiate_device_auth(cloud_client: &CloudClient) -> Result<DeviceAuthSession, ApiError> {
+pub async fn initiate_device_auth(
+    cloud_client: &CloudClient,
+    company_name: &str,
+) -> Result<DeviceAuthSession, ApiError> {
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok();
 
+    let company = company_name.trim();
+
+    let label = if !company.is_empty() {
+        if let Some(ref host) = hostname {
+            format!("{company} ({host})")
+        } else {
+            company.to_string()
+        }
+    } else {
+        hostname.clone().unwrap_or_default()
+    };
+
+    let previous_connection_id = Vault::get_connection_id()
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let request = DeviceInitiateRequest {
-        label: hostname.clone(),
         hostname,
+        label: Some(label),
+        agent_label: if !company.is_empty() {
+            Some(company.to_string())
+        } else {
+            None
+        },
+        company_name: if !company.is_empty() {
+            Some(company.to_string())
+        } else {
+            None
+        },
+        previous_connection_id,
     };
 
     let resp = cloud_client.initiate_device(&request).await?;
@@ -267,13 +305,44 @@ mod tests {
             .await;
 
         let client = CloudClient::from_base_url(&server.uri()).unwrap();
-        let session = initiate_device_auth(&client).await.unwrap();
+        let session = initiate_device_auth(&client, "Acme Corp Ltd").await.unwrap();
 
         assert_eq!(session.device_code, "dev-12345");
         assert_eq!(session.user_code, "WDJB-4K9P");
         assert_eq!(session.verification_uri, "https://app.fininsight.io/device");
         assert_eq!(session.poll_interval_secs, 5);
         assert!(session.expires_at > Instant::now());
+    }
+
+    #[test]
+    fn test_device_initiate_request_payload_shape() {
+        let req = DeviceInitiateRequest {
+            hostname: Some("MY-HOST".into()),
+            label: Some("Acme Corp Ltd (MY-HOST)".into()),
+            agent_label: Some("Acme Corp Ltd".into()),
+            company_name: Some("Acme Corp Ltd".into()),
+            previous_connection_id: Some("conn-prev-123".into()),
+        };
+
+        let json_val = serde_json::to_value(&req).unwrap();
+        assert_eq!(json_val["hostname"], "MY-HOST");
+        assert_eq!(json_val["label"], "Acme Corp Ltd (MY-HOST)");
+        assert_eq!(json_val["agentLabel"], "Acme Corp Ltd");
+        assert_eq!(json_val["companyName"], "Acme Corp Ltd");
+        assert_eq!(json_val["previousConnectionId"], "conn-prev-123");
+
+        // Test deserialization compatibility with aliases
+        let from_snake = serde_json::json!({
+            "hostname": "MY-HOST",
+            "label": "Acme Corp Ltd",
+            "agent_label": "Acme Corp Ltd",
+            "company_name": "Acme Corp Ltd",
+            "previous_connection_id": "conn-prev-123"
+        });
+        let parsed: DeviceInitiateRequest = serde_json::from_value(from_snake).unwrap();
+        assert_eq!(parsed.agent_label.as_deref(), Some("Acme Corp Ltd"));
+        assert_eq!(parsed.company_name.as_deref(), Some("Acme Corp Ltd"));
+        assert_eq!(parsed.previous_connection_id.as_deref(), Some("conn-prev-123"));
     }
 
     #[tokio::test]
