@@ -40,22 +40,62 @@ pub struct DeviceInitiateRequest {
     pub previous_connection_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(non_snake_case)]
 pub struct DeviceInitiateResponse {
-    #[serde(alias = "deviceCode")]
-    pub device_code: String,
-    #[serde(alias = "userCode")]
-    pub user_code: String,
-    #[serde(alias = "verificationUri", alias = "verification_url", alias = "verificationUrl")]
-    pub verification_uri: String,
-    #[serde(default = "default_expires_in", alias = "expiresIn")]
-    pub expires_in: u64,
-    #[serde(alias = "poll_interval", alias = "poll_interval_secs", alias = "pollInterval")]
+    pub device_code: Option<String>,
+    pub deviceCode: Option<String>,
+    pub user_code: Option<String>,
+    pub userCode: Option<String>,
+    pub verification_uri: Option<String>,
+    pub verificationUri: Option<String>,
+    pub verification_url: Option<String>,
+    pub verificationUrl: Option<String>,
+    pub expires_in: Option<u64>,
+    pub expiresIn: Option<u64>,
     pub interval: Option<u64>,
+    pub poll_interval: Option<u64>,
+    pub pollInterval: Option<u64>,
+    pub poll_interval_secs: Option<u64>,
 }
 
-fn default_expires_in() -> u64 {
-    900 // 15 minutes default
+impl DeviceInitiateResponse {
+    pub fn device_code(&self) -> String {
+        self.device_code
+            .clone()
+            .or_else(|| self.deviceCode.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn user_code(&self) -> String {
+        self.user_code
+            .clone()
+            .or_else(|| self.userCode.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn verification_uri(&self) -> String {
+        self.verification_uri
+            .clone()
+            .or_else(|| self.verificationUri.clone())
+            .or_else(|| self.verification_url.clone())
+            .or_else(|| self.verificationUrl.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn expires_in(&self) -> u64 {
+        self.expires_in
+            .or(self.expiresIn)
+            .filter(|&v| v > 0)
+            .unwrap_or(900)
+    }
+
+    pub fn interval(&self) -> Option<u64> {
+        self.interval
+            .or(self.poll_interval)
+            .or(self.pollInterval)
+            .or(self.poll_interval_secs)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,19 +104,31 @@ pub struct DevicePollRequest<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[allow(non_snake_case)]
 pub struct DevicePollResponse {
     pub status: Option<String>,
     pub error: Option<String>,
-    #[serde(alias = "agent_token", alias = "agentToken")]
     pub token: Option<String>,
-    #[serde(alias = "connection_id", alias = "connectionId")]
+    pub agent_token: Option<String>,
+    pub agentToken: Option<String>,
     pub connection_id: Option<String>,
+    pub connectionId: Option<String>,
     pub data: Option<serde_json::Value>,
 }
 
 impl DevicePollResponse {
     pub fn extract_token(&self) -> Option<String> {
         if let Some(ref t) = self.token {
+            if !t.is_empty() {
+                return Some(t.clone());
+            }
+        }
+        if let Some(ref t) = self.agent_token {
+            if !t.is_empty() {
+                return Some(t.clone());
+            }
+        }
+        if let Some(ref t) = self.agentToken {
             if !t.is_empty() {
                 return Some(t.clone());
             }
@@ -95,6 +147,11 @@ impl DevicePollResponse {
 
     pub fn extract_connection_id(&self) -> String {
         if let Some(ref cid) = self.connection_id {
+            if !cid.is_empty() {
+                return cid.clone();
+            }
+        }
+        if let Some(ref cid) = self.connectionId {
             if !cid.is_empty() {
                 return cid.clone();
             }
@@ -154,14 +211,13 @@ pub async fn initiate_device_auth(
 
     let resp = cloud_client.initiate_device(&request).await?;
 
-    let poll_interval_secs = resp.interval.unwrap_or(5).max(1);
-    let expires_in_secs = if resp.expires_in == 0 { 900 } else { resp.expires_in };
-    let expires_at = Instant::now() + Duration::from_secs(expires_in_secs);
+    let poll_interval_secs = resp.interval().unwrap_or(5).max(1);
+    let expires_at = Instant::now() + Duration::from_secs(resp.expires_in());
 
     Ok(DeviceAuthSession {
-        device_code: resp.device_code,
-        user_code: resp.user_code,
-        verification_uri: resp.verification_uri,
+        device_code: resp.device_code(),
+        user_code: resp.user_code(),
+        verification_uri: resp.verification_uri(),
         poll_interval_secs,
         expires_at,
     })
@@ -343,6 +399,45 @@ mod tests {
         assert_eq!(parsed.agent_label.as_deref(), Some("Acme Corp Ltd"));
         assert_eq!(parsed.company_name.as_deref(), Some("Acme Corp Ltd"));
         assert_eq!(parsed.previous_connection_id.as_deref(), Some("conn-prev-123"));
+    }
+
+    #[test]
+    fn test_device_poll_response_dual_key_compatibility() {
+        let dual_keys_json = serde_json::json!({
+            "status": "approved",
+            "connection_id": "conn-123-snake",
+            "connectionId": "conn-123-camel",
+            "agent_token": "token-xyz-snake",
+            "agentToken": "token-xyz-camel",
+            "token": "token-main"
+        });
+
+        let resp: DevicePollResponse = serde_json::from_value(dual_keys_json).unwrap();
+        assert_eq!(resp.extract_token(), Some("token-main".to_string()));
+        assert_eq!(resp.extract_connection_id(), "conn-123-snake");
+    }
+
+    #[test]
+    fn test_device_initiate_response_dual_key_compatibility() {
+        let dual_keys_json = serde_json::json!({
+            "device_code": "dev-123-snake",
+            "deviceCode": "dev-123-camel",
+            "user_code": "USER-snake",
+            "userCode": "USER-camel",
+            "verification_uri": "https://app.fininsight.io/device",
+            "verificationUri": "https://app.fininsight.io/device",
+            "expires_in": 300,
+            "expiresIn": 300,
+            "poll_interval": 5,
+            "pollInterval": 5
+        });
+
+        let resp: DeviceInitiateResponse = serde_json::from_value(dual_keys_json).unwrap();
+        assert_eq!(resp.device_code(), "dev-123-snake");
+        assert_eq!(resp.user_code(), "USER-snake");
+        assert_eq!(resp.verification_uri(), "https://app.fininsight.io/device");
+        assert_eq!(resp.expires_in(), 300);
+        assert_eq!(resp.interval(), Some(5));
     }
 
     #[tokio::test]
