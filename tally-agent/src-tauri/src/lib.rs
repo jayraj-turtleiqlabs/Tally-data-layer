@@ -20,7 +20,7 @@ use tokio::time::{interval, Duration};
 use crate::checkpoint::{Checkpoint, CheckpointStore, ConnectionProfile, ProfileStore};
 use crate::cloud_client::{CloudClient, HeartbeatPayload};
 use crate::device_auth::DeviceAuthSession;
-use crate::errors::{AgentError, ApiError, TallyError};
+use crate::errors::{AgentError, ApiError};
 use crate::sync::{SyncOrchestrator, SyncResult};
 use crate::tally_client::{TallyClient, TallyEndpoint};
 use crate::tally_schema::{CompanyInfo, DiscoveredCompany};
