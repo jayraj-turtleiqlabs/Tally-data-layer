@@ -70,6 +70,15 @@ pub enum VaultError {
 }
 
 #[derive(Debug, Error)]
+pub enum ProfileError {
+    #[error("Failed to read profile: {0}")]
+    Read(String),
+
+    #[error("Failed to write profile: {0}")]
+    Write(String),
+}
+
+#[derive(Debug, Error)]
 pub enum CheckpointError {
     #[error("Failed to read checkpoint: {0}")]
     Read(String),
@@ -88,6 +97,9 @@ pub enum AgentError {
 
     #[error(transparent)]
     Vault(#[from] VaultError),
+
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
 
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),

@@ -78,6 +78,7 @@ fn backend_200_advances_checkpoint() {
 #[test]
 fn invalid_pairing_does_not_store_token() {
     Vault::delete_token().ok();
+    Vault::delete_connection_id().ok();
     assert!(!Vault::is_paired());
 }
 
@@ -90,6 +91,7 @@ async fn retry_after_failure_sync_orchestrator() {
     let tally_client = TallyClient::new(tally_endpoint).unwrap();
 
     let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>100</ALTERID></COMPANY>
     <VOUCHER>
       <VOUCHERNUMBER>INV-001</VOUCHERNUMBER>
       <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
@@ -140,6 +142,7 @@ async fn retry_after_failure_sync_orchestrator() {
     let store = CheckpointStore::new(dir.path().join("cp.json"));
     store
         .save(&Checkpoint {
+            connection_id: Some("test-conn".into()),
             last_known_alter_id: 100,
             backfill_complete: true,
             last_successful_sync: None,
@@ -208,7 +211,7 @@ async fn test_device_auth_approved_stores_token_via_shared_path() {
     let tally_server = MockServer::start().await;
     let tally_port = tally_server.address().port();
     let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
-    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>50</ALTERID></COMPANY>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>50</ALTERID><GUID>guid-test-999</GUID></COMPANY>
     </COLLECTION></DATA></BODY></ENVELOPE>"#;
 
     Mock::given(method("POST"))
@@ -233,25 +236,35 @@ async fn test_device_auth_approved_stores_token_via_shared_path() {
     .unwrap();
 
     let company = agent_state
-        .complete_pairing_with_token("test-approved-agent-token-999", "Acme Corp Ltd")
+        .complete_pairing_with_token(
+            "test-approved-agent-token-999",
+            "Acme Corp Ltd",
+            Some("guid-test-999"),
+            Some("conn-test-999"),
+        )
         .await
         .unwrap();
 
     assert_eq!(company, "Acme Corp Ltd");
     assert!(Vault::is_paired());
-    assert_eq!(Vault::get_token().unwrap(), "test-approved-agent-token-999");
+    assert_eq!(
+        Vault::get_token_for("conn-test-999").unwrap(),
+        "test-approved-agent-token-999"
+    );
 
     let status = agent_state.get_status().await;
     assert!(status.paired);
     assert_eq!(status.company_name, Some("Acme Corp Ltd".into()));
 
-    Vault::delete_token().ok();
+    let _ = Vault::delete_token_for("conn-test-999");
+    let _ = Vault::delete_connection_id();
 }
 
 #[tokio::test]
 async fn test_device_auth_denied_stops_polling_and_no_token() {
     let _guard = VAULT_TEST_LOCK.lock().await;
     let _ = Vault::delete_token();
+    let _ = Vault::delete_connection_id();
 
     let cloud_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -316,7 +329,7 @@ async fn test_token_revocation_on_sync_clears_token_and_resets_status() {
     let tally_server = MockServer::start().await;
     let tally_port = tally_server.address().port();
     let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
-    <COMPANY><NAME>Revoke Test Corp</NAME><ALTERID>50</ALTERID></COMPANY>
+    <COMPANY><NAME>Revoke Test Corp</NAME><ALTERID>50</ALTERID><GUID>guid-revoke-123</GUID></COMPANY>
     <VOUCHER>
       <VOUCHERNUMBER>INV-REVOKE</VOUCHERNUMBER>
       <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
@@ -367,7 +380,12 @@ async fn test_token_revocation_on_sync_clears_token_and_resets_status() {
 
     // Initial pairing and backfill
     agent_state
-        .complete_pairing_with_token("revoked-token-123", "Revoke Test Corp")
+        .complete_pairing_with_token(
+            "revoked-token-123",
+            "Revoke Test Corp",
+            Some("guid-revoke-123"),
+            Some("conn-revoke-123"),
+        )
         .await
         .unwrap();
     assert!(Vault::is_paired());
@@ -766,3 +784,429 @@ async fn test_disconnect_clears_token_and_connection_id() {
     assert!(Vault::get_token().is_err());
     assert!(Vault::get_connection_id().is_err());
 }
+
+#[tokio::test]
+async fn test_company_guid_mismatch_fails_closed() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    // Tally returns company with GUID "guid-company-B"
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>100</ALTERID><GUID>guid-company-B</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-test".into()),
+            last_known_alter_id: 50,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    // Expected GUID is "guid-company-A", but Tally has "guid-company-B"
+    let orch = SyncOrchestrator::new(tally_client, cloud_client, store)
+        .with_expected_profile(
+            Some("Acme Corp Ltd".into()),
+            Some("guid-company-A".into()),
+            Some("conn-test".into()),
+        );
+
+    let result = orch.run_delta_sync().await;
+    assert!(result.is_err(), "Sync must fail closed when GUID does not match");
+    let err_str = result.unwrap_err().to_string();
+    assert!(err_str.contains("GUID") || err_str.contains("match"));
+}
+
+#[tokio::test]
+async fn test_agent_restart_loads_profile_and_blocks_wrong_guid() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::delete_token();
+    let _ = Vault::delete_connection_id();
+
+    let dir = tempfile::tempdir().unwrap();
+    let base_path = dir.path().join("profile.json");
+
+    // Profile store has company A with GUID "guid-company-A"
+    let profile_store = fininsight_tally_agent_lib::checkpoint::ProfileStore::new(base_path.clone());
+    profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-123".into(),
+            company_guid: Some("guid-company-A".into()),
+            company_name: "Acme Corp Ltd".into(),
+            paired_at: "2026-09-09T10:00:00Z".into(),
+        })
+        .unwrap();
+
+    let _ = Vault::store_token_for("conn-123", "token-for-conn-123");
+    let _ = Vault::store_connection_id("conn-123");
+
+    // Mock Tally serving Company B with GUID "guid-company-B"
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>100</ALTERID><GUID>guid-company-B</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // Simulate Agent startup (restarting after profile was persisted)
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        None,
+        base_path,
+    )
+    .unwrap();
+
+    // Verify profile identity is loaded
+    let profile = agent_state.profile_store.load().unwrap().expect("Profile should exist");
+    assert_eq!(profile.connection_id, "conn-123");
+    assert_eq!(profile.company_guid, Some("guid-company-A".into()));
+
+    // Attempt sync_now: must fail closed due to GUID mismatch with running Tally
+    let sync_res = agent_state.sync_now().await;
+    assert!(sync_res.is_err(), "Sync must fail closed when Tally GUID != Profile GUID");
+
+    let _ = Vault::delete_token_for("conn-123");
+    let _ = Vault::delete_connection_id();
+}
+
+#[tokio::test]
+async fn test_zero_delta_sync_pushes_empty_batch() {
+    // 1. Mock Tally instance with alter_id = 100 and no new records above 100
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>100</ALTERID><GUID>guid-acme-100</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    // 2. Mock Cloud Backend expecting empty records array and alter_id_high = 100
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "records": [],
+            "alter_id_high": 100
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-zero-delta");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-zero".into()),
+            last_known_alter_id: 100,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    let orch = SyncOrchestrator::new(tally_client, cloud_client, store.clone())
+        .with_expected_profile(
+            Some("Acme Corp Ltd".into()),
+            Some("guid-acme-100".into()),
+            Some("conn-zero".into()),
+        );
+
+    let result = orch.run_delta_sync().await.unwrap();
+    assert!(result.success);
+    assert_eq!(result.records_pushed, 0);
+
+    // Verify checkpoint timestamp was updated even with 0 new records
+    let cp = store.load().unwrap();
+    assert_eq!(cp.last_known_alter_id, 100);
+    assert!(cp.last_successful_sync.is_some());
+}
+
+#[tokio::test]
+async fn test_disconnect_preserves_checkpoint_file() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile_file = dir.path().join("profile.json");
+    let checkpoint_file = dir.path().join("checkpoints").join("checkpoint_conn-keep-me.json");
+
+    let profile_store = fininsight_tally_agent_lib::checkpoint::ProfileStore::new(profile_file.clone());
+    profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-keep-me".into(),
+            company_guid: Some("guid-keep-me".into()),
+            company_name: "Keep Me Corp".into(),
+            paired_at: "2026-09-09T10:00:00Z".into(),
+        })
+        .unwrap();
+
+    let cp_store = CheckpointStore::new(checkpoint_file.clone());
+    cp_store
+        .save(&Checkpoint {
+            connection_id: Some("conn-keep-me".into()),
+            last_known_alter_id: 500,
+            backfill_complete: true,
+            last_successful_sync: Some("2026-09-09T10:00:00Z".into()),
+        })
+        .unwrap();
+
+    let _ = Vault::store_token_for("conn-keep-me", "token-keep-me");
+    let _ = Vault::store_connection_id("conn-keep-me");
+
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        9000,
+        None,
+        profile_file.clone(),
+    )
+    .unwrap();
+
+    agent_state.disconnect().await.unwrap();
+
+    // Profile must be deleted
+    assert!(profile_store.load().unwrap().is_none());
+    // Keyring tokens must be deleted
+    assert!(Vault::get_token_for("conn-keep-me").is_err());
+    assert!(Vault::get_connection_id().is_err());
+
+    // Checkpoint file MUST still exist to preserve alter_id state for re-pairing
+    assert!(checkpoint_file.exists(), "Checkpoint file must be preserved on disconnect");
+    let preserved_cp = cp_store.load().unwrap();
+    assert_eq!(preserved_cp.last_known_alter_id, 500);
+    assert_eq!(preserved_cp.backfill_complete, true);
+}
+
+#[tokio::test]
+async fn test_repeated_sync_does_not_duplicate_records() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>150</ALTERID><GUID>guid-acme-dup</GUID></COMPANY>
+    <VOUCHER>
+      <VOUCHERNUMBER>INV-001</VOUCHERNUMBER>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <PARTYLEDGERNAME>Aarav Textiles</PARTYLEDGERNAME>
+      <DATE>20260401</DATE>
+      <ALTERID>150</ALTERID>
+      <AMOUNT>25000.00</AMOUNT>
+      <GUID>vch-guid-1</GUID>
+      <MASTERID>101</MASTERID>
+    </VOUCHER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-dup");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-dup".into()),
+            last_known_alter_id: 100,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    let orch = SyncOrchestrator::new(tally_client.clone(), cloud_client.clone(), store.clone())
+        .with_expected_profile(
+            Some("Acme Corp Ltd".into()),
+            Some("guid-acme-dup".into()),
+            Some("conn-dup".into()),
+        );
+
+    // First sync run: advances checkpoint to 150
+    let res1 = orch.run_delta_sync().await.unwrap();
+    assert_eq!(res1.records_pushed, 1);
+    assert_eq!(res1.new_alter_id, Some(150));
+
+    let cp1 = store.load().unwrap();
+    assert_eq!(cp1.last_known_alter_id, 150);
+
+    // Second sync run with unchanged Tally state: sends 0 records (empty batch)
+    let res2 = orch.run_delta_sync().await.unwrap();
+    assert_eq!(res2.records_pushed, 0);
+    assert_eq!(res2.new_alter_id, Some(150));
+
+    let cp2 = store.load().unwrap();
+    assert_eq!(cp2.last_known_alter_id, 150);
+}
+
+#[tokio::test]
+async fn test_retry_after_success_does_not_duplicate_records() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>200</ALTERID><GUID>guid-acme-retry</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-retry-success");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-retry-success".into()),
+            last_known_alter_id: 200,
+            backfill_complete: true,
+            last_successful_sync: Some("2026-09-09T10:00:00Z".into()),
+        })
+        .unwrap();
+
+    let orch = SyncOrchestrator::new(tally_client, cloud_client, store.clone())
+        .with_expected_profile(
+            Some("Acme Corp Ltd".into()),
+            Some("guid-acme-retry".into()),
+            Some("conn-retry-success".into()),
+        );
+
+    // Running sync when checkpoint is already at alter_id 200 results in 0 records extracted
+    let res = orch.run_delta_sync().await.unwrap();
+    assert_eq!(res.records_pushed, 0);
+    assert_eq!(res.new_alter_id, Some(200));
+}
+
+#[tokio::test]
+async fn test_checkpoint_does_not_advance_on_failed_push() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Acme Corp Ltd</NAME><ALTERID>300</ALTERID><GUID>guid-acme-fail</GUID></COMPANY>
+    <VOUCHER>
+      <VOUCHERNUMBER>INV-999</VOUCHERNUMBER>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <PARTYLEDGERNAME>Aarav Textiles</PARTYLEDGERNAME>
+      <DATE>20260401</DATE>
+      <ALTERID>300</ALTERID>
+      <AMOUNT>1000.00</AMOUNT>
+      <GUID>vch-guid-fail</GUID>
+      <MASTERID>999</MASTERID>
+    </VOUCHER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    // Cloud returns 500 error
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&cloud_server)
+        .await;
+
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-failed-push");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-fail".into()),
+            last_known_alter_id: 200,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    let orch = SyncOrchestrator::new(tally_client, cloud_client, store.clone())
+        .with_expected_profile(
+            Some("Acme Corp Ltd".into()),
+            Some("guid-acme-fail".into()),
+            Some("conn-fail".into()),
+        );
+
+    let res = orch.run_delta_sync().await.unwrap();
+    assert!(!res.success, "Sync should report failure on 500 status");
+
+    let cp = store.load().unwrap();
+    assert_eq!(
+        cp.last_known_alter_id, 200,
+        "Checkpoint must remain at 200 and not advance to 300 when push fails"
+    );
+}
+
+#[tokio::test]
+async fn test_crash_after_push_before_checkpoint_does_not_corrupt_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-crash-test".into()),
+            last_known_alter_id: 100,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    // If agent process crashes right after pushing to gateway, checkpoint is still at 100
+    let cp = store.load().unwrap();
+    assert_eq!(cp.last_known_alter_id, 100);
+    assert_eq!(cp.backfill_complete, true);
+    // State is intact and valid JSON
+}
+

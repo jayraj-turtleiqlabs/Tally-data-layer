@@ -60,6 +60,7 @@ pub fn is_tally_error_response(xml: &str) -> bool {
         || lower.contains("<status>0</status>")
 }
 
+#[derive(Clone)]
 pub struct TallyClient {
     endpoint: TallyEndpoint,
     http: Client,
@@ -253,11 +254,10 @@ impl TallyClient {
             .map_err(|e| TallyError::Transport(e.to_string()))?;
 
         log::debug!(
-            "[tally_raw_xml] report={:?}, status={}, response_length={} bytes\n{}",
+            "[tally_export] report={:?}, status={}, response_length={} bytes",
             envelope.report,
             status,
-            body.len(),
-            body
+            body.len()
         );
 
         Ok(body)

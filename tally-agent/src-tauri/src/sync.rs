@@ -76,7 +76,9 @@ pub struct SyncOrchestrator {
     cloud: CloudClient,
     checkpoint_store: CheckpointStore,
     batch_size: usize,
-    expected_company: Option<String>,
+    connection_id: Option<String>,
+    expected_company_guid: Option<String>,
+    expected_company_name: Option<String>,
     sync_in_progress: Arc<AtomicBool>,
 }
 
@@ -99,7 +101,9 @@ impl SyncOrchestrator {
             cloud,
             checkpoint_store,
             batch_size: DEFAULT_BATCH_SIZE,
-            expected_company: None,
+            connection_id: None,
+            expected_company_guid: None,
+            expected_company_name: None,
             sync_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -110,7 +114,19 @@ impl SyncOrchestrator {
     }
 
     pub fn with_expected_company(mut self, company: Option<String>) -> Self {
-        self.expected_company = company;
+        self.expected_company_name = company;
+        self
+    }
+
+    pub fn with_expected_profile(
+        mut self,
+        company_name: Option<String>,
+        company_guid: Option<String>,
+        connection_id: Option<String>,
+    ) -> Self {
+        self.expected_company_name = company_name;
+        self.expected_company_guid = company_guid;
+        self.connection_id = connection_id;
         self
     }
 
@@ -120,6 +136,69 @@ impl SyncOrchestrator {
 
     pub fn load_checkpoint(&self) -> Result<Checkpoint, AgentError> {
         Ok(self.checkpoint_store.load()?)
+    }
+
+    /// Verifies the active Tally company against the expected profile (GUID-first, name as fallback/display).
+    pub async fn verify_active_company(&self) -> Result<crate::tally_schema::CompanyInfo, AgentError> {
+        let company = self.tally.ping().await?;
+
+        // 1. If paired with an expected company GUID, verify strictly by GUID
+        if let Some(ref expected_guid) = self.expected_company_guid {
+            if !expected_guid.trim().is_empty() {
+                match &company.company_guid {
+                    Some(current_guid) if current_guid.eq_ignore_ascii_case(expected_guid) => {
+                        // Match confirmed by immutable GUID
+                        return Ok(company);
+                    }
+                    Some(current_guid) => {
+                        log::warn!(
+                            "Tally active company GUID '{}' does not match paired GUID '{}' (Company: '{}')",
+                            current_guid,
+                            expected_guid,
+                            company.company_name
+                        );
+                        return Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch {
+                            current: format!("{} (GUID: {})", company.company_name, current_guid),
+                            expected: format!(
+                                "{} (GUID: {})",
+                                self.expected_company_name.as_deref().unwrap_or(&company.company_name),
+                                expected_guid
+                            ),
+                        }));
+                    }
+                    None => {
+                        // Tally did not return a GUID when expected -> fail closed
+                        log::warn!(
+                            "Tally active company '{}' has no GUID; refusing sync for paired GUID '{}'",
+                            company.company_name,
+                            expected_guid
+                        );
+                        return Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch {
+                            current: format!("{} (No GUID)", company.company_name),
+                            expected: format!(
+                                "{} (GUID: {})",
+                                self.expected_company_name.as_deref().unwrap_or(&company.company_name),
+                                expected_guid
+                            ),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 2. If expected company name is set (without GUID constraint), verify name
+        if let Some(ref expected_name) = self.expected_company_name {
+            if !expected_name.trim().is_empty()
+                && !company.company_name.eq_ignore_ascii_case(expected_name)
+            {
+                return Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch {
+                    current: company.company_name,
+                    expected: expected_name.clone(),
+                }));
+            }
+        }
+
+        Ok(company)
     }
 
     /// Initial backfill — runs once automatically after pairing.
@@ -141,20 +220,7 @@ impl SyncOrchestrator {
     async fn do_initial_backfill(&self) -> Result<SyncResult, AgentError> {
         log::info!("Starting initial backfill");
 
-        let company = self.tally.ping().await?;
-        if let Some(ref expected) = self.expected_company {
-            if !expected.is_empty() && !company.company_name.eq_ignore_ascii_case(expected) {
-                log::warn!(
-                    "Tally active company '{}' does not match paired company '{}'",
-                    company.company_name,
-                    expected
-                );
-                return Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch {
-                    current: company.company_name,
-                    expected: expected.clone(),
-                }));
-            }
-        }
+        let company = self.verify_active_company().await?;
 
         let ledgers = self.tally.export_ledgers().await?;
         let vouchers = self.tally.export_vouchers().await?;
@@ -194,7 +260,11 @@ impl SyncOrchestrator {
 
         all_records.push((
             "company".into(),
-            json!({ "name": company.company_name, "alter_id": company.alter_id }),
+            json!({
+                "name": company.company_name,
+                "alter_id": company.alter_id,
+                "guid": company.company_guid
+            }),
             company.alter_id,
         ));
 
@@ -290,33 +360,44 @@ impl SyncOrchestrator {
             return Err(AgentError::BackfillRequired);
         }
 
-        if let Some(ref expected) = self.expected_company {
-            let company = self.tally.ping().await?;
-            if !expected.is_empty() && !company.company_name.eq_ignore_ascii_case(expected) {
-                log::warn!(
-                    "Tally active company '{}' does not match paired company '{}'",
-                    company.company_name,
-                    expected
-                );
-                return Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch {
-                    current: company.company_name,
-                    expected: expected.clone(),
-                }));
-            }
-        }
+        let _company = self.verify_active_company().await?;
 
         let last_known = checkpoint.last_known_alter_id;
         log::info!("Delta sync from ALTERID > {}", last_known);
 
-        let deltas = self.tally.export_delta(last_known).await?;
+        let mut deltas = self.tally.export_delta(last_known).await?;
+        deltas.retain(|d| d.alter_id > last_known);
 
         if deltas.is_empty() {
-            return Ok(SyncResult {
-                success: true,
-                records_pushed: 0,
-                new_alter_id: Some(last_known),
-                error_message: None,
-            });
+            log::info!("Delta sync found 0 new records since ALTERID > {}. Pushing empty batch to acknowledge sync.", last_known);
+            let empty_payload = DeltaSyncPayload {
+                records: vec![],
+                alter_id_high: last_known,
+            };
+            match self.cloud.push_delta(&empty_payload).await {
+                Ok(()) => {
+                    self.checkpoint_store.advance_on_ack(last_known, false)?;
+                    return Ok(SyncResult {
+                        success: true,
+                        records_pushed: 0,
+                        new_alter_id: Some(last_known),
+                        error_message: None,
+                    });
+                }
+                Err(crate::errors::ApiError::TokenRevoked) => {
+                    log::warn!("Delta sync detected revoked token during zero-delta push");
+                    return Err(AgentError::Api(crate::errors::ApiError::TokenRevoked));
+                }
+                Err(e) => {
+                    log::warn!("Zero-delta push note: {}", redact(&e.to_string()));
+                    return Ok(SyncResult {
+                        success: true,
+                        records_pushed: 0,
+                        new_alter_id: Some(last_known),
+                        error_message: None,
+                    });
+                }
+            }
         }
 
         let records: Vec<serde_json::Value> = deltas
@@ -404,6 +485,8 @@ mod tests {
             amount: Some(5000.0),
             party_name: Some("Aarav Textiles".into()),
             party_ledger_name: Some("Aarav Textiles".into()),
+            guid: Some("vch-guid-1".into()),
+            master_id: Some("1001".into()),
         };
         assert_eq!(check_voucher_quality(&valid_vch), None);
 
@@ -415,6 +498,8 @@ mod tests {
             amount: Some(5000.0),
             party_name: Some("Aarav Textiles".into()),
             party_ledger_name: Some("Aarav Textiles".into()),
+            guid: None,
+            master_id: None,
         };
         assert!(check_voucher_quality(&empty_num_vch).is_some());
 
@@ -426,6 +511,8 @@ mod tests {
             amount: Some(5000.0),
             party_name: Some("Aarav Textiles".into()),
             party_ledger_name: Some("Aarav Textiles".into()),
+            guid: None,
+            master_id: None,
         };
         assert!(check_voucher_quality(&invalid_date_vch).is_some());
 
@@ -437,6 +524,8 @@ mod tests {
             amount: Some(-5000.0),
             party_name: Some("Aarav Textiles".into()),
             party_ledger_name: Some("Aarav Textiles".into()),
+            guid: None,
+            master_id: None,
         };
         assert!(check_voucher_quality(&negative_sales_vch).is_some());
 
@@ -448,6 +537,8 @@ mod tests {
             amount: Some(5000.0),
             party_name: Some("   ".into()),
             party_ledger_name: Some("   ".into()),
+            guid: None,
+            master_id: None,
         };
         assert!(check_voucher_quality(&empty_party_sales_vch).is_some());
     }
@@ -459,6 +550,8 @@ mod tests {
             parent: "Bank Accounts".into(),
             alter_id: 50,
             opening_balance: Some(10000.0),
+            guid: Some("led-guid-1".into()),
+            master_id: Some("501".into()),
         };
         assert_eq!(check_ledger_quality(&valid_l), None);
 
@@ -467,6 +560,8 @@ mod tests {
             parent: "Bank Accounts".into(),
             alter_id: 51,
             opening_balance: Some(10000.0),
+            guid: None,
+            master_id: None,
         };
         assert!(check_ledger_quality(&empty_name_l).is_some());
     }

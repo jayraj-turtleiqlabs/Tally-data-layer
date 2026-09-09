@@ -16,7 +16,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 
-use crate::checkpoint::{Checkpoint, CheckpointStore};
+use crate::checkpoint::{Checkpoint, CheckpointStore, ConnectionProfile, ProfileStore};
 use crate::cloud_client::{CloudClient, HeartbeatPayload};
 use crate::device_auth::DeviceAuthSession;
 use crate::errors::{AgentError, ApiError};
@@ -53,6 +53,7 @@ pub struct AgentState {
     pub cloud_base_url: Option<String>,
     pub status: RwLock<AgentStatus>,
     pub orchestrator: Mutex<Option<SyncOrchestrator>>,
+    pub profile_store: ProfileStore,
     pub checkpoint_store: CheckpointStore,
     pub active_device_session: Mutex<Option<DeviceAuthSession>>,
 }
@@ -73,14 +74,50 @@ impl AgentState {
             Some(url) => CloudClient::from_base_url(url)?,
             None => CloudClient::new()?,
         };
-        if let Ok(token) = Vault::get_token() {
-            cloud = cloud.with_token(&token);
+
+        let base_dir = checkpoint_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let profile_path = if checkpoint_path.file_name().and_then(|n| n.to_str()) == Some("profile.json") {
+            checkpoint_path.clone()
+        } else {
+            base_dir.join("profile.json")
+        };
+        let profile_store = ProfileStore::new(profile_path);
+        let profile = profile_store.load().ok().flatten();
+
+        let (connection_id, company_guid, company_name, paired) = if let Some(ref p) = profile {
+            (
+                Some(p.connection_id.clone()),
+                p.company_guid.clone(),
+                Some(p.company_name.clone()),
+                true,
+            )
+        } else {
+            (None, None, None, Vault::is_paired())
+        };
+
+        let checkpoint_store = if let Some(ref cid) = connection_id {
+            let store = CheckpointStore::for_connection_in_dir(base_dir, cid);
+            let _ = store.migrate_legacy_if_needed(cid);
+            store
+        } else {
+            CheckpointStore::new(checkpoint_path)
+        };
+
+        let token = if let Some(ref cid) = connection_id {
+            Vault::get_token_for(cid).or_else(|_| Vault::get_token()).ok()
+        } else {
+            Vault::get_token().ok()
+        };
+
+        if let Some(ref t) = token {
+            cloud = cloud.with_token(t);
         }
-        let checkpoint_store = CheckpointStore::new(checkpoint_path);
+
         let checkpoint = checkpoint_store.load().unwrap_or_default();
 
         let status = AgentStatus {
-            paired: Vault::is_paired(),
+            paired,
+            company_name: company_name.clone(),
             tally_reachable: false,
             sync_idle: true,
             last_successful_sync: checkpoint.last_successful_sync.clone(),
@@ -89,15 +126,15 @@ impl AgentState {
             ..Default::default()
         };
 
+        let orch = SyncOrchestrator::new(tally, cloud, checkpoint_store.clone())
+            .with_expected_profile(company_name, company_guid, connection_id);
+
         Ok(Self {
             tally_port,
             cloud_base_url,
             status: RwLock::new(status),
-            orchestrator: Mutex::new(Some(SyncOrchestrator::new(
-                tally,
-                cloud,
-                checkpoint_store.clone(),
-            ))),
+            orchestrator: Mutex::new(Some(orch)),
+            profile_store,
             checkpoint_store,
             active_device_session: Mutex::new(None),
         })
@@ -111,12 +148,29 @@ impl AgentState {
     }
 
     pub async fn refresh_status(&self) {
-        let paired = Vault::is_paired();
-        let checkpoint = self.checkpoint_store.load().unwrap_or_default();
+        let profile = self.profile_store.load().ok().flatten();
+        let paired = if let Some(ref p) = profile {
+            Vault::get_token_for(&p.connection_id).is_ok()
+        } else {
+            Vault::is_paired()
+        };
+        let conn_checkpoint_store = if let Some(ref p) = profile {
+            CheckpointStore::for_connection(&p.connection_id)
+        } else {
+            self.checkpoint_store.clone()
+        };
+        let checkpoint = conn_checkpoint_store.load().unwrap_or_default();
         let tally_reachable = self.check_tally_reachable().await;
 
         let mut status = self.status.write().await;
         status.paired = paired;
+        if paired {
+            if let Some(ref p) = profile {
+                status.company_name = Some(p.company_name.clone());
+            }
+        } else {
+            status.company_name = None;
+        }
         status.tally_reachable = tally_reachable;
         status.last_known_alter_id = checkpoint.last_known_alter_id;
         status.backfill_complete = checkpoint.backfill_complete;
@@ -139,13 +193,38 @@ impl AgentState {
         &self,
         token: &str,
         company_name: &str,
+        company_guid: Option<&str>,
+        connection_id: Option<&str>,
     ) -> Result<String, AgentError> {
-        log::debug!("[pair] Storing agent token in vault...");
-        Vault::store_token(token)?;
-        log::debug!("[pair] Token stored");
+        let cid = connection_id
+            .map(String::from)
+            .or_else(|| Vault::get_connection_id().ok())
+            .unwrap_or_else(|| "default-connection".into());
 
-        // Reset checkpoint on fresh pairing so a fresh initial backfill is guaranteed
-        let _ = self.checkpoint_store.save(&Checkpoint::default());
+        let cguid = company_guid.map(String::from);
+
+        let profile = ConnectionProfile {
+            connection_id: cid.clone(),
+            company_guid: cguid.clone(),
+            company_name: company_name.to_string(),
+            paired_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        log::debug!("[pair] Saving connection profile for '{}' (cid: {})...", company_name, cid);
+        self.profile_store.save(&profile)?;
+
+        log::debug!("[pair] Storing agent token in vault for connection {}...", cid);
+        Vault::store_token_for(&cid, token)?;
+        let _ = Vault::store_connection_id(&cid);
+
+        let conn_checkpoint_store = CheckpointStore::for_connection(&cid);
+        // Reset or init checkpoint for this fresh pairing
+        let _ = conn_checkpoint_store.save(&Checkpoint {
+            connection_id: Some(cid.clone()),
+            last_known_alter_id: 0,
+            last_successful_sync: None,
+            backfill_complete: false,
+        });
 
         {
             let mut status = self.status.write().await;
@@ -155,15 +234,19 @@ impl AgentState {
             status.backfill_complete = false;
         }
 
-        // Rebuild orchestrator with fresh clients
+        // Rebuild orchestrator with fresh clients & expected profile
         {
             let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
             let tally = TallyClient::new(endpoint)?;
             let cloud = self.new_cloud_client()?.with_token(token);
             let mut orch = self.orchestrator.lock().await;
             *orch = Some(
-                SyncOrchestrator::new(tally, cloud, self.checkpoint_store.clone())
-                    .with_expected_company(Some(company_name.to_string())),
+                SyncOrchestrator::new(tally, cloud, conn_checkpoint_store)
+                    .with_expected_profile(
+                        Some(company_name.to_string()),
+                        cguid,
+                        Some(cid),
+                    ),
             );
         }
 
@@ -208,14 +291,14 @@ impl AgentState {
         };
 
         let token = response.token()?;
-        if let Some(cid) = response.connection_id() {
-            if !cid.trim().is_empty() {
-                if let Err(e) = Vault::store_connection_id(cid.trim()) {
-                    log::warn!("Failed to store connection_id from pair response: {:?}", e);
-                }
-            }
-        }
-        self.complete_pairing_with_token(&token, &company.company_name).await
+        let cid = response.connection_id();
+        self.complete_pairing_with_token(
+            &token,
+            &company.company_name,
+            company.company_guid.as_deref(),
+            cid.as_deref(),
+        )
+        .await
     }
 
     pub async fn start_device_login(&self) -> Result<DeviceAuthPublicSession, AgentError> {
@@ -279,12 +362,18 @@ impl AgentState {
         match status {
             crate::device_auth::DeviceAuthStatus::Approved { agent_token, connection_id } => {
                 log::info!("[device_login] Step 5: Device approved! Setting up connection...");
-                if !connection_id.trim().is_empty() {
-                    if let Err(e) = Vault::store_connection_id(connection_id.trim()) {
-                        log::warn!("Failed to store connection_id from device auth approval: {:?}", e);
-                    }
-                }
-                self.complete_pairing_with_token(&agent_token, &company.company_name).await
+                let cid = if connection_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(connection_id.trim())
+                };
+                self.complete_pairing_with_token(
+                    &agent_token,
+                    &company.company_name,
+                    company.company_guid.as_deref(),
+                    cid,
+                )
+                .await
             }
             crate::device_auth::DeviceAuthStatus::Denied => {
                 log::warn!("[device_login] Device authorization was denied");
@@ -311,9 +400,17 @@ impl AgentState {
     }
 
     pub async fn disconnect(&self) -> Result<(), AgentError> {
-        Vault::delete_token()?;
+        let profile = self.profile_store.load().ok().flatten();
+        if let Some(ref p) = profile {
+            let _ = Vault::delete_token_for(&p.connection_id);
+        } else {
+            let _ = Vault::delete_token();
+        }
         let _ = Vault::delete_connection_id();
-        let _ = self.checkpoint_store.save(&Checkpoint::default());
+        let _ = self.profile_store.delete();
+
+        // NOTE: Connection checkpoint file is intentionally preserved across disconnect
+        // to prevent data loss or duplicate upload if reconnected.
 
         let mut status = self.status.write().await;
         *status = AgentStatus::default();
@@ -323,10 +420,14 @@ impl AgentState {
 
     pub async fn handle_token_revoked(&self) {
         log::warn!("Agent token has been revoked or expired. Clearing credentials and prompting re-pairing.");
-        let _ = Vault::delete_token();
-        // NOTE: connection_id is intentionally preserved in the vault across token revocation
-        // to enable direct re-pairing without duplicate connection creation.
-        let _ = self.checkpoint_store.save(&Checkpoint::default());
+        let profile = self.profile_store.load().ok().flatten();
+        if let Some(ref p) = profile {
+            let _ = Vault::delete_token_for(&p.connection_id);
+        } else {
+            let _ = Vault::delete_token();
+        }
+        // NOTE: Profile & checkpoint file are preserved across token revocation
+        // to enable direct re-pairing without duplicate connection creation or data loss.
 
         let mut status = self.status.write().await;
         status.paired = false;
@@ -349,7 +450,14 @@ impl AgentState {
             status.last_error = None;
         }
 
-        let checkpoint = match self.checkpoint_store.load() {
+        let profile = self.profile_store.load().ok().flatten();
+        let conn_checkpoint_store = if let Some(ref p) = profile {
+            CheckpointStore::for_connection(&p.connection_id)
+        } else {
+            self.checkpoint_store.clone()
+        };
+
+        let checkpoint = match conn_checkpoint_store.load() {
             Ok(cp) => cp,
             Err(e) => {
                 let mut status = self.status.write().await;
@@ -381,14 +489,12 @@ impl AgentState {
 
             match &result {
                 Ok(r) if r.success => {
-                    status.last_successful_sync = self
-                        .checkpoint_store
+                    status.last_successful_sync = conn_checkpoint_store
                         .load()
                         .ok()
                         .and_then(|c| c.last_successful_sync);
                     status.last_known_alter_id = r.new_alter_id.unwrap_or(status.last_known_alter_id);
-                    status.backfill_complete = self
-                        .checkpoint_store
+                    status.backfill_complete = conn_checkpoint_store
                         .load()
                         .map(|c| c.backfill_complete)
                         .unwrap_or(false);
@@ -478,11 +584,27 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
                 status.tally_reachable = tally_reachable;
             }
 
-            let checkpoint = state.checkpoint_store.load().unwrap_or_default();
-            let token = match Vault::get_token() {
-                Ok(t) => t,
-                Err(_) => continue,
+            let profile = state.profile_store.load().ok().flatten();
+            let (cid, token) = if let Some(ref p) = profile {
+                let tok = match Vault::get_token_for(&p.connection_id).or_else(|_| Vault::get_token()) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                (Some(p.connection_id.clone()), tok)
+            } else {
+                let tok = match Vault::get_token() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                (Vault::get_connection_id().ok(), tok)
             };
+
+            let conn_checkpoint_store = if let Some(ref id) = cid {
+                CheckpointStore::for_connection(id)
+            } else {
+                state.checkpoint_store.clone()
+            };
+            let checkpoint = conn_checkpoint_store.load().unwrap_or_default();
             let cloud = match state.new_cloud_client() {
                 Ok(c) => c.with_token(&token),
                 Err(_) => continue,

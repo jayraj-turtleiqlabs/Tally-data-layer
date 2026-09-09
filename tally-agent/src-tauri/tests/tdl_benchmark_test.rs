@@ -64,6 +64,7 @@ fn generate_custom_tdl_vouchers_xml(count: usize) -> String {
     <DATE>20260401</DATE>
     <ALTERID>{i}</ALTERID>
     <AMOUNT>15000.00</AMOUNT>
+    <GUID>00000000-0000-0000-0000-{i:012}</GUID>
   </FININSIGHTVOUCHERLINE>
 "#
         ));

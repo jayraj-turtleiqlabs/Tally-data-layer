@@ -26,6 +26,8 @@ pub trait TallySchemaAdapter: Send + Sync {
 pub struct CompanyInfo {
     pub company_name: String,
     pub alter_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_guid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -34,6 +36,10 @@ pub struct LedgerRecord {
     pub parent: String,
     pub alter_id: u64,
     pub opening_balance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -47,6 +53,10 @@ pub struct VoucherRecord {
     pub party_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub party_ledger_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub master_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,6 +142,7 @@ fn parse_company_info_common(xml: &str) -> Result<CompanyInfo, TallyError> {
 
     let mut company_name = None;
     let mut alter_id = None;
+    let mut company_guid = None;
     let mut buf = Vec::new();
     let mut in_company = false;
     let mut current_tag = String::new();
@@ -143,8 +154,13 @@ fn parse_company_info_common(xml: &str) -> Result<CompanyInfo, TallyError> {
                 if name == "COMPANY" || name == "COLLECTION" {
                     in_company = true;
                 }
-                if name == "COMPANY" && company_name.is_none() {
-                    company_name = attribute_value(&e, "NAME")?;
+                if name == "COMPANY" {
+                    if company_name.is_none() {
+                        company_name = attribute_value(&e, "NAME")?;
+                    }
+                    if company_guid.is_none() {
+                        company_guid = attribute_value(&e, "GUID")?;
+                    }
                 }
                 current_tag = name;
             }
@@ -152,7 +168,7 @@ fn parse_company_info_common(xml: &str) -> Result<CompanyInfo, TallyError> {
                 let text = e.unescape().map_err(|_| {
                     TallyError::MalformedXml("invalid text encoding".into())
                 })?;
-                match current_tag.as_str() {
+                match current_tag.to_ascii_uppercase().as_str() {
                     "NAME" | "COMPANYNAME" if in_company && company_name.is_none() => {
                         company_name = Some(text.to_string());
                     }
@@ -161,13 +177,24 @@ fn parse_company_info_common(xml: &str) -> Result<CompanyInfo, TallyError> {
                             alter_id = Some(id);
                         }
                     }
+                    "GUID" | "COMPANYGUID" if in_company && company_guid.is_none() => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            company_guid = Some(trimmed.to_string());
+                        }
+                    }
                     _ => {}
                 }
             }
             Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "ALTERID" {
-                    // self-closing tag variant
+                if name == "COMPANY" {
+                    if company_name.is_none() {
+                        company_name = attribute_value(&e, "NAME")?;
+                    }
+                    if company_guid.is_none() {
+                        company_guid = attribute_value(&e, "GUID")?;
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -185,6 +212,7 @@ fn parse_company_info_common(xml: &str) -> Result<CompanyInfo, TallyError> {
     Ok(CompanyInfo {
         company_name,
         alter_id,
+        company_guid,
     })
 }
 
@@ -208,6 +236,8 @@ fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, Tally
     let mut parent = String::new();
     let mut alter_id = 0u64;
     let mut opening_balance = None;
+    let mut guid = None;
+    let mut master_id = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -219,6 +249,8 @@ fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, Tally
                     parent.clear();
                     alter_id = 0;
                     opening_balance = None;
+                    guid = attribute_value(&e, "GUID")?;
+                    master_id = attribute_value(&e, "MASTERID")?;
                     if let Some(value) = attribute_value(&e, "NAME")? {
                         name = value;
                     }
@@ -234,6 +266,8 @@ fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, Tally
                             parent: parent.clone(),
                             alter_id,
                             opening_balance,
+                            guid: guid.clone(),
+                            master_id: master_id.clone(),
                         });
                     }
                     in_ledger = false;
@@ -251,6 +285,18 @@ fn parse_ledgers_common(xml: &str, tag: &str) -> Result<Vec<LedgerRecord>, Tally
                     }
                     "OPENINGBALANCE" => {
                         opening_balance = text.trim().parse().ok();
+                    }
+                    "GUID" => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            guid = Some(trimmed.to_string());
+                        }
+                    }
+                    "MASTERID" => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            master_id = Some(trimmed.to_string());
+                        }
                     }
                     _ => {}
                 }
@@ -303,6 +349,8 @@ fn parse_vouchers_common(xml: &str, tag: &str) -> Result<Vec<VoucherRecord>, Tal
     let mut alter_id = 0u64;
     let mut amount = None;
     let mut party_name = None;
+    let mut guid = None;
+    let mut master_id = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -316,6 +364,8 @@ fn parse_vouchers_common(xml: &str, tag: &str) -> Result<Vec<VoucherRecord>, Tal
                     alter_id = 0;
                     amount = None;
                     party_name = None;
+                    guid = attribute_value(&e, "GUID")?;
+                    master_id = attribute_value(&e, "MASTERID")?;
                 }
                 current_tag = tag_name;
             }
@@ -330,6 +380,8 @@ fn parse_vouchers_common(xml: &str, tag: &str) -> Result<Vec<VoucherRecord>, Tal
                         amount,
                         party_name: party_name.clone(),
                         party_ledger_name: party_name.clone(),
+                        guid: guid.clone(),
+                        master_id: master_id.clone(),
                     });
                     in_voucher = false;
                 }
@@ -348,6 +400,18 @@ fn parse_vouchers_common(xml: &str, tag: &str) -> Result<Vec<VoucherRecord>, Tal
                         let trimmed = text.trim();
                         if !trimmed.is_empty() && party_name.is_none() {
                             party_name = Some(trimmed.to_string());
+                        }
+                    }
+                    "GUID" => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            guid = Some(trimmed.to_string());
+                        }
+                    }
+                    "MASTERID" => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            master_id = Some(trimmed.to_string());
                         }
                     }
                     _ => {}

@@ -43,7 +43,7 @@ pub const TDL_CUSTOM_VOUCHERS_REPORT: &str = r#"          <REPORT NAME="FinInsig
             <SCROLLED>Vertical</SCROLLED>
           </PART>
           <LINE NAME="FinInsightVoucherLine">
-            <FIELDS>FldVoucherNumber, FldVoucherType, FldDate, FldAlterId, FldAmount, FldPartyName</FIELDS>
+            <FIELDS>FldVoucherNumber, FldVoucherType, FldDate, FldAlterId, FldAmount, FldPartyName, FldGuid, FldMasterId</FIELDS>
           </LINE>
           <FIELD NAME="FldVoucherNumber">
             <SET>$VoucherNumber</SET>
@@ -68,6 +68,14 @@ pub const TDL_CUSTOM_VOUCHERS_REPORT: &str = r#"          <REPORT NAME="FinInsig
           <FIELD NAME="FldPartyName">
             <SET>if $$IsEmpty:$PartyLedgerName then $PartyName else $PartyLedgerName</SET>
             <XMLTAG>PARTYLEDGERNAME</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldGuid">
+            <SET>$GUID</SET>
+            <XMLTAG>GUID</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldMasterId">
+            <SET>$$String:$MasterId</SET>
+            <XMLTAG>MASTERID</XMLTAG>
           </FIELD>"#;
 
 pub const TDL_CUSTOM_LEDGERS_REPORT: &str = r#"          <REPORT NAME="FinInsightLedgerReport">
@@ -82,7 +90,7 @@ pub const TDL_CUSTOM_LEDGERS_REPORT: &str = r#"          <REPORT NAME="FinInsigh
             <SCROLLED>Vertical</SCROLLED>
           </PART>
           <LINE NAME="FinInsightLedgerLine">
-            <FIELDS>FldLedgerName, FldParent, FldAlterId, FldOpeningBalance</FIELDS>
+            <FIELDS>FldLedgerName, FldParent, FldAlterId, FldOpeningBalance, FldGuid, FldMasterId</FIELDS>
           </LINE>
           <FIELD NAME="FldLedgerName">
             <SET>$Name</SET>
@@ -99,6 +107,14 @@ pub const TDL_CUSTOM_LEDGERS_REPORT: &str = r#"          <REPORT NAME="FinInsigh
           <FIELD NAME="FldOpeningBalance">
             <SET>$OpeningBalance</SET>
             <XMLTAG>OPENINGBALANCE</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldGuid">
+            <SET>$GUID</SET>
+            <XMLTAG>GUID</XMLTAG>
+          </FIELD>
+          <FIELD NAME="FldMasterId">
+            <SET>$$String:$MasterId</SET>
+            <XMLTAG>MASTERID</XMLTAG>
           </FIELD>"#;
 
 impl ExportEnvelope {
@@ -172,11 +188,11 @@ impl ExportEnvelope {
             }
             _ => {
                 let (collection_name, entity_type, fetch_fields) = match report {
-                    ExportReport::CompanyInfo => ("Collection of Companies", "Company", "NAME, ALTERID"),
-                    ExportReport::Ledgers => ("Ledgers", "Ledger", "NAME, PARENT, ALTERID, OPENINGBALANCE"),
-                    ExportReport::Groups => ("Groups", "Group", "NAME, PARENT, ALTERID"),
-                    ExportReport::Vouchers => ("Vouchers", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT, PARTYLEDGERNAME, PARTYNAME"),
-                    ExportReport::DeltaCollection => ("AlterIds", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT, PARTYLEDGERNAME, PARTYNAME"),
+                    ExportReport::CompanyInfo => ("Collection of Companies", "Company", "NAME, ALTERID, GUID"),
+                    ExportReport::Ledgers => ("Ledgers", "Ledger", "NAME, PARENT, ALTERID, OPENINGBALANCE, GUID, MASTERID"),
+                    ExportReport::Groups => ("Groups", "Group", "NAME, PARENT, ALTERID, GUID, MASTERID"),
+                    ExportReport::Vouchers => ("Vouchers", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT, PARTYLEDGERNAME, PARTYNAME, GUID, MASTERID"),
+                    ExportReport::DeltaCollection => ("AlterIds", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT, PARTYLEDGERNAME, PARTYNAME, GUID, MASTERID"),
                     _ => unreachable!(),
                 };
 

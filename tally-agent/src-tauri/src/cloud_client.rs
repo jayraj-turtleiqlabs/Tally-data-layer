@@ -139,6 +139,7 @@ impl HeartbeatResponse {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CloudClient {
     http: Client,
     base_url: String,
