@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use fininsight_tally_agent_lib::{
-    spawn_heartbeat_loop, AgentState, AgentStatus, DeviceAuthPublicSession,
+    spawn_heartbeat_loop, AgentState, AgentStatus, CompanyItem, DeviceAuthPublicSession,
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -21,6 +21,61 @@ fn validate_startup_config(tally_port: u16) -> Result<(), String> {
     fininsight_tally_agent_lib::tally_client::TallyEndpoint::new("127.0.0.1", tally_port)
         .map_err(|e| format!("Refusing to start: {e}"))?;
     Ok(())
+}
+
+#[tauri::command]
+async fn get_companies(state: tauri::State<'_, Arc<AgentState>>) -> Result<Vec<CompanyItem>, String> {
+    Ok(state.get_companies_cached().await)
+}
+
+#[tauri::command]
+async fn refresh_companies(state: tauri::State<'_, Arc<AgentState>>) -> Result<Vec<CompanyItem>, String> {
+    state.discover_and_merge_companies().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn initiate_company_connection(
+    company_name: String,
+    company_guid: Option<String>,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<DeviceAuthPublicSession, String> {
+    state
+        .start_company_device_login(&company_name, company_guid.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn poll_company_connection(
+    company_name: String,
+    company_guid: Option<String>,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<String, String> {
+    state
+        .poll_company_device_login(&company_name, company_guid.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sync_company(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    let result = state.sync_company(&connection_id).await.map_err(|e| e.to_string())?;
+    if result.success {
+        Ok(())
+    } else {
+        Err(result.error_message.unwrap_or_else(|| "Sync failed. Please try again.".into()))
+    }
+}
+
+#[tauri::command]
+async fn disconnect_company(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    state.disconnect_company(&connection_id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -148,6 +203,12 @@ fn main() {
     tauri::Builder::default()
         .manage(agent_state)
         .invoke_handler(tauri::generate_handler![
+            get_companies,
+            refresh_companies,
+            initiate_company_connection,
+            poll_company_connection,
+            sync_company,
+            disconnect_company,
             get_agent_status,
             pair_agent,
             initiate_device_login,

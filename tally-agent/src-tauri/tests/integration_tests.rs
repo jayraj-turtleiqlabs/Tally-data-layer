@@ -344,29 +344,11 @@ async fn test_token_revocation_on_sync_clears_token_and_resets_status() {
         .mount(&tally_server)
         .await;
 
-    // 2. Mock Cloud Backend to return 200 on initial backfill, but 401 Unauthorized on subsequent delta sync
+    // 2. Mock Cloud Backend to return 401 Unauthorized on sync
     let cloud_server = MockServer::start().await;
-
-    struct BackfillOkThen401 {
-        count: std::sync::atomic::AtomicUsize,
-    }
-
-    impl wiremock::Respond for BackfillOkThen401 {
-        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-            let prev = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if prev == 0 {
-                ResponseTemplate::new(200) // Initial backfill
-            } else {
-                ResponseTemplate::new(401) // Delta sync revoked
-            }
-        }
-    }
-
     Mock::given(method("POST"))
         .and(path("/api/v1/agent/sync/delta"))
-        .respond_with(BackfillOkThen401 {
-            count: std::sync::atomic::AtomicUsize::new(0),
-        })
+        .respond_with(ResponseTemplate::new(401))
         .mount(&cloud_server)
         .await;
 
@@ -448,7 +430,7 @@ async fn test_initial_backfill_with_zero_records_does_not_advance_checkpoint() {
     let empty_collection_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION></COLLECTION></DATA></BODY></ENVELOPE>"#;
 
     Mock::given(method("POST"))
-        .and(wiremock::matchers::body_string_contains("Collection of Companies"))
+        .and(wiremock::matchers::body_string_contains("FinInsightActiveCompanyColl"))
         .respond_with(ResponseTemplate::new(200).set_body_string(company_xml))
         .mount(&tally_server)
         .await;
@@ -502,7 +484,7 @@ async fn test_initial_backfill_with_partial_ledger_data_advances_checkpoint() {
     let empty_vouchers_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION></COLLECTION></DATA></BODY></ENVELOPE>"#;
 
     Mock::given(method("POST"))
-        .and(wiremock::matchers::body_string_contains("Collection of Companies"))
+        .and(wiremock::matchers::body_string_contains("FinInsightActiveCompanyColl"))
         .respond_with(ResponseTemplate::new(200).set_body_string(company_xml))
         .mount(&tally_server)
         .await;
@@ -839,7 +821,7 @@ async fn test_agent_restart_loads_profile_and_blocks_wrong_guid() {
     let _ = Vault::delete_connection_id();
 
     let dir = tempfile::tempdir().unwrap();
-    let base_path = dir.path().join("profile.json");
+    let base_path = dir.path().join("profiles.json");
 
     // Profile store has company A with GUID "guid-company-A"
     let profile_store = fininsight_tally_agent_lib::checkpoint::ProfileStore::new(base_path.clone());
@@ -953,7 +935,7 @@ async fn test_zero_delta_sync_pushes_empty_batch() {
 async fn test_disconnect_preserves_checkpoint_file() {
     let _guard = VAULT_TEST_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let profile_file = dir.path().join("profile.json");
+    let profile_file = dir.path().join("profiles.json");
     let checkpoint_file = dir.path().join("checkpoints").join("checkpoint_conn-keep-me.json");
 
     let profile_store = fininsight_tally_agent_lib::checkpoint::ProfileStore::new(profile_file.clone());
@@ -1208,5 +1190,709 @@ async fn test_crash_after_push_before_checkpoint_does_not_corrupt_state() {
     assert_eq!(cp.last_known_alter_id, 100);
     assert_eq!(cp.backfill_complete, true);
     // State is intact and valid JSON
+}
+
+#[tokio::test]
+async fn test_multi_company_discovery_parses_all_and_matches_active() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+
+    // Tally returns 2 companies in List of Companies
+    let company_list_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>DemoCorp</NAME><ALTERID>230</ALTERID><GUID>guid-demo-111</GUID></COMPANY>
+    <COMPANY><NAME>ThunderClaps</NAME><ALTERID>450</ALTERID><GUID>guid-thunder-222</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(company_list_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let discovered = tally_client.discover_companies().await.unwrap();
+    assert_eq!(discovered.len(), 2);
+    assert_eq!(discovered[0].company_name, "DemoCorp");
+    assert_eq!(discovered[0].company_guid.as_deref(), Some("guid-demo-111"));
+    assert_eq!(discovered[1].company_name, "ThunderClaps");
+    assert_eq!(discovered[1].company_guid.as_deref(), Some("guid-thunder-222"));
+
+    // ping takes the first company from collection
+    let active = tally_client.ping().await.unwrap();
+    assert_eq!(active.company_name, "DemoCorp");
+    assert_eq!(active.company_guid.as_deref(), Some("guid-demo-111"));
+}
+
+#[tokio::test]
+async fn test_company_switching_updates_active_and_blocks_inactive_sync() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+
+    // Tally currently has DemoCorp active
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>DemoCorp</NAME><ALTERID>230</ALTERID><GUID>guid-demo-111</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-multi");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_b = CheckpointStore::for_connection_in_dir(dir.path(), "conn-thunder-222");
+    store_b
+        .save(&Checkpoint {
+            connection_id: Some("conn-thunder-222".into()),
+            last_known_alter_id: 450,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    // Trying to sync ThunderClaps while DemoCorp is active in Tally MUST fail closed
+    let orch_b = SyncOrchestrator::new(tally_client.clone(), cloud_client.clone(), store_b)
+        .with_expected_profile(
+            Some("ThunderClaps".into()),
+            Some("guid-thunder-222".into()),
+            Some("conn-thunder-222".into()),
+        );
+
+    let res_b = orch_b.run_delta_sync().await;
+    assert!(res_b.is_err(), "Syncing ThunderClaps must fail when DemoCorp is active in Tally");
+    let err_msg = res_b.unwrap_err().to_string();
+    assert!(err_msg.contains("DemoCorp") || err_msg.contains("guid-demo-111"));
+}
+
+#[tokio::test]
+async fn test_multi_company_sync_isolation_company_a_vs_company_b() {
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+
+    // Tally has DemoCorp active with a new voucher
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>DemoCorp</NAME><ALTERID>250</ALTERID><GUID>guid-demo-111</GUID></COMPANY>
+    <VOUCHER>
+      <VOUCHERNUMBER>INV-DEMO-01</VOUCHERNUMBER>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <PARTYLEDGERNAME>Customer X</PARTYLEDGERNAME>
+      <DATE>20260401</DATE>
+      <ALTERID>250</ALTERID>
+      <AMOUNT>15000.00</AMOUNT>
+      <GUID>vch-guid-demo</GUID>
+      <MASTERID>2501</MASTERID>
+    </VOUCHER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-demo");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store_a = CheckpointStore::for_connection_in_dir(dir.path(), "conn-demo-111");
+    store_a
+        .save(&Checkpoint {
+            connection_id: Some("conn-demo-111".into()),
+            last_known_alter_id: 230,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    let store_b = CheckpointStore::for_connection_in_dir(dir.path(), "conn-thunder-222");
+    store_b
+        .save(&Checkpoint {
+            connection_id: Some("conn-thunder-222".into()),
+            last_known_alter_id: 450,
+            backfill_complete: true,
+            last_successful_sync: Some("2026-09-09T08:00:00Z".into()),
+        })
+        .unwrap();
+
+    // Sync Company A
+    let orch_a = SyncOrchestrator::new(tally_client, cloud_client, store_a.clone())
+        .with_expected_profile(
+            Some("DemoCorp".into()),
+            Some("guid-demo-111".into()),
+            Some("conn-demo-111".into()),
+        );
+
+    let res_a = orch_a.run_delta_sync().await.unwrap();
+    assert!(res_a.success);
+    assert_eq!(res_a.records_pushed, 1);
+    assert_eq!(res_a.new_alter_id, Some(250));
+
+    // Verify Checkpoint A advanced to 250
+    let cp_a = store_a.load().unwrap();
+    assert_eq!(cp_a.last_known_alter_id, 250);
+
+    // Verify Checkpoint B remained strictly untouched at 450
+    let cp_b = store_b.load().unwrap();
+    assert_eq!(cp_b.last_known_alter_id, 450);
+    assert_eq!(cp_b.last_successful_sync.as_deref(), Some("2026-09-09T08:00:00Z"));
+}
+
+#[tokio::test]
+async fn test_crash_and_retry_idempotent_recovery() {
+    // Scenario:
+    // 1. Agent extracts voucher alter_id=300 from Tally.
+    // 2. Gateway accepts sync (HTTP 200).
+    // 3. Agent crashes before local checkpoint update (simulated: checkpoint file still at 200).
+    // 4. Agent restarts and retries the exact same batch.
+    // 5. Gateway receives idempotent batch, returns HTTP 200.
+    // 6. Checkpoint successfully advances to 300 without duplicate records.
+
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>DemoCorp</NAME><ALTERID>300</ALTERID><GUID>guid-demo-111</GUID></COMPANY>
+    <VOUCHER>
+      <VOUCHERNUMBER>INV-300</VOUCHERNUMBER>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <PARTYLEDGERNAME>Customer Y</PARTYLEDGERNAME>
+      <DATE>20260401</DATE>
+      <ALTERID>300</ALTERID>
+      <AMOUNT>50000.00</AMOUNT>
+      <GUID>vch-guid-300</GUID>
+      <MASTERID>3001</MASTERID>
+    </VOUCHER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", tally_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token-crash-recovery");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::for_connection_in_dir(dir.path(), "conn-crash-rec");
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-crash-rec".into()),
+            last_known_alter_id: 200,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    // Step 1: Agent run 1 -> pushes to gateway
+    let orch1 = SyncOrchestrator::new(tally_client.clone(), cloud_client.clone(), store.clone())
+        .with_expected_profile(
+            Some("DemoCorp".into()),
+            Some("guid-demo-111".into()),
+            Some("conn-crash-rec".into()),
+        );
+
+    // Simulate crash after Gateway HTTP 200 by manually resetting checkpoint store back to 200
+    let res1 = orch1.run_delta_sync().await.unwrap();
+    assert!(res1.success);
+    assert_eq!(res1.new_alter_id, Some(300));
+
+    // Force checkpoint back to pre-crash state (alter_id=200)
+    store
+        .save(&Checkpoint {
+            connection_id: Some("conn-crash-rec".into()),
+            last_known_alter_id: 200,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    assert_eq!(store.load().unwrap().last_known_alter_id, 200);
+
+    // Step 2: Agent restarts and retries the sync
+    let orch2 = SyncOrchestrator::new(tally_client, cloud_client, store.clone())
+        .with_expected_profile(
+            Some("DemoCorp".into()),
+            Some("guid-demo-111".into()),
+            Some("conn-crash-rec".into()),
+        );
+
+    let res2 = orch2.run_delta_sync().await.unwrap();
+    assert!(res2.success);
+    assert_eq!(res2.records_pushed, 1);
+    assert_eq!(res2.new_alter_id, Some(300));
+
+    // Checkpoint reaches correct value 300
+    let final_cp = store.load().unwrap();
+    assert_eq!(final_cp.last_known_alter_id, 300);
+    assert!(final_cp.last_successful_sync.is_some());
+
+    // Verify exactly 2 requests reached the gateway (both identical payloads)
+    let reqs = cloud_server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    let b1: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    let b2: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+    assert_eq!(b1, b2);
+}
+
+#[tokio::test]
+async fn test_crash_during_company_a_sync_leaves_company_b_state_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_a = CheckpointStore::for_connection_in_dir(dir.path(), "conn-a");
+    let store_b = CheckpointStore::for_connection_in_dir(dir.path(), "conn-b");
+
+    store_a
+        .save(&Checkpoint {
+            connection_id: Some("conn-a".into()),
+            last_known_alter_id: 100,
+            backfill_complete: true,
+            last_successful_sync: None,
+        })
+        .unwrap();
+
+    store_b
+        .save(&Checkpoint {
+            connection_id: Some("conn-b".into()),
+            last_known_alter_id: 500,
+            backfill_complete: true,
+            last_successful_sync: Some("2026-09-09T09:00:00Z".into()),
+        })
+        .unwrap();
+
+    // Mock Tally failure/crash during Company A extraction
+    let unused_port = 59997;
+    let tally_endpoint = TallyEndpoint::new("127.0.0.1", unused_port).unwrap();
+    let tally_client = TallyClient::new(tally_endpoint).unwrap();
+
+    let cloud_server = MockServer::start().await;
+    let cloud_client = CloudClient::from_base_url(&cloud_server.uri())
+        .unwrap()
+        .with_token("test-token");
+
+    let orch_a = SyncOrchestrator::new(tally_client, cloud_client, store_a.clone())
+        .with_expected_profile(
+            Some("Company A".into()),
+            Some("guid-a".into()),
+            Some("conn-a".into()),
+        );
+
+    let res_a = orch_a.run_delta_sync().await;
+    assert!(res_a.is_err());
+
+    // Company A checkpoint unchanged
+    let cp_a = store_a.load().unwrap();
+    assert_eq!(cp_a.last_known_alter_id, 100);
+
+    // Company B checkpoint completely untouched
+    let cp_b = store_b.load().unwrap();
+    assert_eq!(cp_b.last_known_alter_id, 500);
+    assert_eq!(cp_b.last_successful_sync.as_deref(), Some("2026-09-09T09:00:00Z"));
+}
+
+#[tokio::test]
+async fn test_inactive_company_can_be_paired_while_another_company_active() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    // 1. Tally has DemoCorp active
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>DemoCorp</NAME><ALTERID>100</ALTERID><GUID>guid-demo-111</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // 2. Mock Cloud Backend for device auth
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/initiate"))
+        .and(wiremock::matchers::body_string_contains("ThunderClaps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-thunder-code",
+            "user_code": "THUNDER-CODE",
+            "verification_uri": "https://app.fininsight.io/device",
+            "expires_in": 300,
+            "interval": 5
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "approved",
+            "agent_token": "token-thunder-secret",
+            "connection_id": "conn-thunder-222"
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("profiles.json"),
+    )
+    .unwrap();
+
+    // Initiate pairing for ThunderClaps (which is NOT the active company in Tally)
+    let init_res = agent_state
+        .start_company_device_login("ThunderClaps", Some("guid-thunder-222"))
+        .await;
+    assert!(init_res.is_ok(), "Initiating pairing for inactive ThunderClaps must succeed");
+    let session = init_res.unwrap();
+    assert_eq!(session.user_code, "THUNDER-CODE");
+
+    // Poll and complete pairing
+    let paired_name = agent_state
+        .poll_company_device_login("ThunderClaps", Some("guid-thunder-222"))
+        .await
+        .unwrap();
+    assert_eq!(paired_name, "ThunderClaps");
+
+    // Verify connection profile for ThunderClaps was stored with its exact GUID
+    let profile = agent_state.profile_store.get_by_connection_id("conn-thunder-222").unwrap().unwrap();
+    assert_eq!(profile.company_name, "ThunderClaps");
+    assert_eq!(profile.company_guid.as_deref(), Some("guid-thunder-222"));
+
+    // Verify token stored in vault for ThunderClaps
+    assert_eq!(Vault::get_token_for("conn-thunder-222").unwrap(), "token-thunder-secret");
+
+    let _ = Vault::delete_token_for("conn-thunder-222");
+    let _ = Vault::delete_connection_id();
+}
+
+#[tokio::test]
+async fn test_democorp_data_can_never_be_pushed_through_thunderclaps_connection() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    // Tally currently has DemoCorp open with private invoices
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>DemoCorp</NAME><ALTERID>500</ALTERID><GUID>guid-demo-111</GUID></COMPANY>
+    <VOUCHER>
+      <VOUCHERNUMBER>INV-DEMO-SECRET</VOUCHERNUMBER>
+      <VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
+      <PARTYLEDGERNAME>Confidential Party</PARTYLEDGERNAME>
+      <DATE>20260401</DATE>
+      <ALTERID>500</ALTERID>
+      <AMOUNT>999999.00</AMOUNT>
+      <GUID>vch-demo-secret</GUID>
+    </VOUCHER>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // Mock Cloud Backend — should NEVER receive any sync requests
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let base_path = dir.path().join("profiles.json");
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        base_path,
+    )
+    .unwrap();
+
+    // Save ThunderClaps connection profile
+    agent_state
+        .profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-thunder-222".into(),
+            company_guid: Some("guid-thunder-222".into()),
+            company_name: "ThunderClaps".into(),
+            paired_at: "2026-09-09T10:00:00Z".into(),
+        })
+        .unwrap();
+
+    let _ = Vault::store_token_for("conn-thunder-222", "token-thunder-222");
+
+    // Attempting to sync ThunderClaps while DemoCorp is active MUST fail closed
+    let sync_res = agent_state.sync_company("conn-thunder-222").await;
+    assert!(sync_res.is_err(), "Syncing ThunderClaps must fail closed when DemoCorp is open");
+    let err = sync_res.unwrap_err();
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("Open 'ThunderClaps' in Tally to sync this company") || err_msg.contains("guid-thunder-222"),
+        "Error must clearly instruct user to open ThunderClaps: got '{err_msg}'"
+    );
+
+    // Verify 0 delta sync requests reached cloud backend
+    let reqs = cloud_server.received_requests().await.unwrap();
+    let delta_reqs: Vec<_> = reqs.iter().filter(|r| r.url.path().contains("/sync/")).collect();
+    assert_eq!(delta_reqs.len(), 0, "No data from DemoCorp can ever be pushed to ThunderClaps connection");
+
+    let _ = Vault::delete_token_for("conn-thunder-222");
+    let _ = Vault::delete_connection_id();
+}
+
+#[tokio::test]
+async fn test_restart_preserves_multiple_company_profiles_and_tokens() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profiles_file = dir.path().join("profiles.json");
+
+    let profile_store = fininsight_tally_agent_lib::checkpoint::ProfileStore::new(profiles_file.clone());
+    profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-demo-111".into(),
+            company_guid: Some("guid-demo-111".into()),
+            company_name: "DemoCorp".into(),
+            paired_at: "2026-09-09T08:00:00Z".into(),
+        })
+        .unwrap();
+
+    profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-thunder-222".into(),
+            company_guid: Some("guid-thunder-222".into()),
+            company_name: "ThunderClaps".into(),
+            paired_at: "2026-09-09T09:00:00Z".into(),
+        })
+        .unwrap();
+
+    let _ = Vault::store_token_for("conn-demo-111", "token-demo-111");
+    let _ = Vault::store_token_for("conn-thunder-222", "token-thunder-222");
+
+    let cp_store_a = CheckpointStore::for_connection_in_dir(dir.path(), "conn-demo-111");
+    cp_store_a
+        .save(&Checkpoint {
+            connection_id: Some("conn-demo-111".into()),
+            last_known_alter_id: 120,
+            backfill_complete: true,
+            last_successful_sync: Some("2026-09-09T08:30:00Z".into()),
+        })
+        .unwrap();
+
+    let cp_store_b = CheckpointStore::for_connection_in_dir(dir.path(), "conn-thunder-222");
+    cp_store_b
+        .save(&Checkpoint {
+            connection_id: Some("conn-thunder-222".into()),
+            last_known_alter_id: 450,
+            backfill_complete: true,
+            last_successful_sync: Some("2026-09-09T09:30:00Z".into()),
+        })
+        .unwrap();
+
+    // Simulate Agent restart
+    let restarted_agent = fininsight_tally_agent_lib::AgentState::with_options(
+        9000,
+        None,
+        profiles_file,
+    )
+    .unwrap();
+
+    let loaded_profiles = restarted_agent.profile_store.load_all().unwrap();
+    assert_eq!(loaded_profiles.len(), 2);
+
+    let prof_a = restarted_agent.profile_store.get_by_connection_id("conn-demo-111").unwrap().unwrap();
+    assert_eq!(prof_a.company_name, "DemoCorp");
+    assert_eq!(prof_a.company_guid.as_deref(), Some("guid-demo-111"));
+
+    let prof_b = restarted_agent.profile_store.get_by_connection_id("conn-thunder-222").unwrap().unwrap();
+    assert_eq!(prof_b.company_name, "ThunderClaps");
+    assert_eq!(prof_b.company_guid.as_deref(), Some("guid-thunder-222"));
+
+    assert_eq!(Vault::get_token_for("conn-demo-111").unwrap(), "token-demo-111");
+    assert_eq!(Vault::get_token_for("conn-thunder-222").unwrap(), "token-thunder-222");
+
+    let loaded_cp_a = cp_store_a.load().unwrap();
+    assert_eq!(loaded_cp_a.last_known_alter_id, 120);
+
+    let loaded_cp_b = cp_store_b.load().unwrap();
+    assert_eq!(loaded_cp_b.last_known_alter_id, 450);
+
+    let _ = Vault::delete_token_for("conn-demo-111");
+    let _ = Vault::delete_token_for("conn-thunder-222");
+    let _ = Vault::delete_connection_id();
+}
+
+#[tokio::test]
+async fn test_active_company_dynamic_transitions_a_b_c_d() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    // Shared state to switch active company dynamically
+    let active_name = std::sync::Arc::new(std::sync::Mutex::new("DemoCorp".to_string()));
+    let active_guid = std::sync::Arc::new(std::sync::Mutex::new("guid-demo-111".to_string()));
+
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+
+    // 1. Discovery list mock: returns all 3 companies
+    let discovery_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>DemoCorp</NAME><ALTERID>100</ALTERID><GUID>guid-demo-111</GUID></COMPANY>
+    <COMPANY><NAME>ThunderClaps</NAME><ALTERID>200</ALTERID><GUID>guid-thunder-222</GUID></COMPANY>
+    <COMPANY><NAME>WireSnaks</NAME><ALTERID>300</ALTERID><GUID>guid-wiresnaks-333</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains("Collection of Companies"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(discovery_xml))
+        .mount(&tally_server)
+        .await;
+
+    // 2. Active company ping mock: returns the current active company dynamically
+    struct DynamicActiveResponder {
+        name: std::sync::Arc<std::sync::Mutex<String>>,
+        guid: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    impl wiremock::Respond for DynamicActiveResponder {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let n = self.name.lock().unwrap().clone();
+            let g = self.guid.lock().unwrap().clone();
+            let xml = format!(
+                r#"<ENVELOPE><BODY><DATA><COLLECTION>
+                <COMPANY><NAME>{}</NAME><ALTERID>150</ALTERID><GUID>{}</GUID></COMPANY>
+                </COLLECTION></DATA></BODY></ENVELOPE>"#,
+                n, g
+            );
+            ResponseTemplate::new(200).set_body_string(xml)
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains("FinInsightActiveCompanyColl"))
+        .respond_with(DynamicActiveResponder {
+            name: active_name.clone(),
+            guid: active_guid.clone(),
+        })
+        .mount(&tally_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profiles_file = dir.path().join("profiles.json");
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        None,
+        profiles_file,
+    )
+    .unwrap();
+
+    // Setup 2 connected profiles: DemoCorp and ThunderClaps. WireSnaks is unconnected.
+    agent_state
+        .profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-demo-111".into(),
+            company_guid: Some("guid-demo-111".into()),
+            company_name: "DemoCorp".into(),
+            paired_at: "2026-09-09T08:00:00Z".into(),
+        })
+        .unwrap();
+
+    agent_state
+        .profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-thunder-222".into(),
+            company_guid: Some("guid-thunder-222".into()),
+            company_name: "ThunderClaps".into(),
+            paired_at: "2026-09-09T09:00:00Z".into(),
+        })
+        .unwrap();
+
+    // Transition A: DemoCorp is active in Tally
+    *active_name.lock().unwrap() = "DemoCorp".to_string();
+    *active_guid.lock().unwrap() = "guid-demo-111".to_string();
+
+    let items_a = agent_state.discover_and_merge_companies().await.unwrap();
+    let demo_a = items_a.iter().find(|i| i.company_name == "DemoCorp").unwrap();
+    let thunder_a = items_a.iter().find(|i| i.company_name == "ThunderClaps").unwrap();
+    let wiresnaks_a = items_a.iter().find(|i| i.company_name == "WireSnaks").unwrap();
+
+    assert_eq!(demo_a.status, "Connected · Active");
+    assert_eq!(demo_a.is_active_in_tally, true);
+    assert_eq!(thunder_a.status, "Connected · Inactive in Tally");
+    assert_eq!(thunder_a.is_active_in_tally, false);
+    assert_eq!(wiresnaks_a.status, "Available · Not Active");
+    assert_eq!(wiresnaks_a.is_active_in_tally, false);
+
+    // Transition B: User switches active company in Tally to ThunderClaps
+    *active_name.lock().unwrap() = "ThunderClaps".to_string();
+    *active_guid.lock().unwrap() = "guid-thunder-222".to_string();
+
+    let items_b = agent_state.discover_and_merge_companies().await.unwrap();
+    let demo_b = items_b.iter().find(|i| i.company_name == "DemoCorp").unwrap();
+    let thunder_b = items_b.iter().find(|i| i.company_name == "ThunderClaps").unwrap();
+    let wiresnaks_b = items_b.iter().find(|i| i.company_name == "WireSnaks").unwrap();
+
+    assert_eq!(demo_b.status, "Connected · Inactive in Tally");
+    assert_eq!(demo_b.is_active_in_tally, false);
+    assert_eq!(thunder_b.status, "Connected · Active");
+    assert_eq!(thunder_b.is_active_in_tally, true);
+    assert_eq!(wiresnaks_b.status, "Available · Not Active");
+    assert_eq!(wiresnaks_b.is_active_in_tally, false);
+
+    // Transition C: User switches active company in Tally to WireSnaks (unconnected)
+    *active_name.lock().unwrap() = "WireSnaks".to_string();
+    *active_guid.lock().unwrap() = "guid-wiresnaks-333".to_string();
+
+    let items_c = agent_state.discover_and_merge_companies().await.unwrap();
+    let demo_c = items_c.iter().find(|i| i.company_name == "DemoCorp").unwrap();
+    let thunder_c = items_c.iter().find(|i| i.company_name == "ThunderClaps").unwrap();
+    let wiresnaks_c = items_c.iter().find(|i| i.company_name == "WireSnaks").unwrap();
+
+    assert_eq!(demo_c.status, "Connected · Inactive in Tally");
+    assert_eq!(demo_c.is_active_in_tally, false);
+    assert_eq!(thunder_c.status, "Connected · Inactive in Tally");
+    assert_eq!(thunder_c.is_active_in_tally, false);
+    assert_eq!(wiresnaks_c.status, "Available · Active");
+    assert_eq!(wiresnaks_c.is_active_in_tally, true);
+
+    // Transition D: User switches back to DemoCorp
+    *active_name.lock().unwrap() = "DemoCorp".to_string();
+    *active_guid.lock().unwrap() = "guid-demo-111".to_string();
+
+    let items_d = agent_state.discover_and_merge_companies().await.unwrap();
+    let demo_d = items_d.iter().find(|i| i.company_name == "DemoCorp").unwrap();
+    let thunder_d = items_d.iter().find(|i| i.company_name == "ThunderClaps").unwrap();
+    let wiresnaks_d = items_d.iter().find(|i| i.company_name == "WireSnaks").unwrap();
+
+    assert_eq!(demo_d.status, "Connected · Active");
+    assert_eq!(demo_d.is_active_in_tally, true);
+    assert_eq!(thunder_d.status, "Connected · Inactive in Tally");
+    assert_eq!(thunder_d.is_active_in_tally, false);
+    assert_eq!(wiresnaks_d.status, "Available · Not Active");
+    assert_eq!(wiresnaks_d.is_active_in_tally, false);
 }
 

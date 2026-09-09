@@ -42,18 +42,6 @@ impl Vault {
             Err(e) => return Err(VaultError::Keyring(e.to_string())),
         }
 
-        // One-time migration: check legacy account, migrate to connection-scoped key, and purge legacy
-        if let Ok(legacy_entry) = Self::entry_for(LEGACY_TOKEN_ACCOUNT) {
-            if let Ok(legacy_token) = legacy_entry.get_password() {
-                let trimmed = legacy_token.trim().to_string();
-                if !trimmed.is_empty() {
-                    let _ = Self::store_token_for(connection_id, &trimmed);
-                    let _ = legacy_entry.delete_credential();
-                    return Ok(trimmed);
-                }
-            }
-        }
-
         Err(VaultError::NotFound)
     }
 

@@ -17,9 +17,18 @@ pub enum TallyVariant {
 pub trait TallySchemaAdapter: Send + Sync {
     fn variant(&self) -> TallyVariant;
     fn parse_company_info(&self, xml: &str) -> Result<CompanyInfo, TallyError>;
+    fn parse_company_list(&self, xml: &str) -> Result<Vec<DiscoveredCompany>, TallyError>;
     fn parse_ledgers(&self, xml: &str) -> Result<Vec<LedgerRecord>, TallyError>;
     fn parse_vouchers(&self, xml: &str) -> Result<Vec<VoucherRecord>, TallyError>;
     fn parse_delta_records(&self, xml: &str) -> Result<Vec<DeltaRecord>, TallyError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiscoveredCompany {
+    pub company_name: String,
+    pub alter_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_guid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +109,10 @@ impl TallySchemaAdapter for Erp9Adapter {
         parse_company_info_common(xml)
     }
 
+    fn parse_company_list(&self, xml: &str) -> Result<Vec<DiscoveredCompany>, TallyError> {
+        parse_company_list_common(xml)
+    }
+
     fn parse_ledgers(&self, xml: &str) -> Result<Vec<LedgerRecord>, TallyError> {
         parse_ledgers_common(xml, "LEDGER")
     }
@@ -122,6 +135,10 @@ impl TallySchemaAdapter for PrimeAdapter {
         parse_company_info_common(xml)
     }
 
+    fn parse_company_list(&self, xml: &str) -> Result<Vec<DiscoveredCompany>, TallyError> {
+        parse_company_list_common(xml)
+    }
+
     fn parse_ledgers(&self, xml: &str) -> Result<Vec<LedgerRecord>, TallyError> {
         // TallyPrime may use LEDGER.LIST wrapper — handled in common parser
         parse_ledgers_common(xml, "LEDGER")
@@ -134,6 +151,109 @@ impl TallySchemaAdapter for PrimeAdapter {
     fn parse_delta_records(&self, xml: &str) -> Result<Vec<DeltaRecord>, TallyError> {
         parse_delta_common(xml)
     }
+}
+
+fn parse_company_list_common(xml: &str) -> Result<Vec<DiscoveredCompany>, TallyError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut companies = Vec::new();
+    let mut buf = Vec::new();
+    let mut in_company = false;
+    let mut current_tag = String::new();
+
+    let mut current_name: Option<String> = None;
+    let mut current_alter_id: Option<u64> = None;
+    let mut current_guid: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if tag_name.eq_ignore_ascii_case("COMPANY") {
+                    in_company = true;
+                    current_name = attribute_value(&e, "NAME")?;
+                    current_guid = attribute_value(&e, "GUID")?;
+                    if let Some(alter_str) = attribute_value(&e, "ALTERID")? {
+                        current_alter_id = alter_str.trim().parse().ok();
+                    } else {
+                        current_alter_id = None;
+                    }
+                }
+                current_tag = tag_name;
+            }
+            Ok(Event::End(e)) => {
+                let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if tag_name.eq_ignore_ascii_case("COMPANY") && in_company {
+                    if let Some(name) = current_name.take() {
+                        if !name.trim().is_empty() {
+                            let alter_id = current_alter_id.unwrap_or(0);
+                            let guid = current_guid.take().filter(|g| !g.trim().is_empty());
+                            if !companies.iter().any(|c: &DiscoveredCompany| c.company_name.eq_ignore_ascii_case(&name)) {
+                                companies.push(DiscoveredCompany {
+                                    company_name: name,
+                                    alter_id,
+                                    company_guid: guid,
+                                });
+                            }
+                        }
+                    }
+                    in_company = false;
+                    current_alter_id = None;
+                    current_guid = None;
+                }
+            }
+            Ok(Event::Text(e)) if in_company => {
+                let text = e.unescape().map_err(|_| {
+                    TallyError::MalformedXml("invalid text encoding".into())
+                })?;
+                let trimmed = text.trim();
+                match current_tag.to_ascii_uppercase().as_str() {
+                    "NAME" | "COMPANYNAME" => {
+                        if !trimmed.is_empty() {
+                            current_name = Some(trimmed.to_string());
+                        }
+                    }
+                    "ALTERID" | "ALTERID.LIST" => {
+                        if let Ok(id) = trimmed.parse::<u64>() {
+                            current_alter_id = Some(id);
+                        }
+                    }
+                    "GUID" | "COMPANYGUID" => {
+                        if !trimmed.is_empty() {
+                            current_guid = Some(trimmed.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if tag_name.eq_ignore_ascii_case("COMPANY") {
+                    let name = attribute_value(&e, "NAME")?;
+                    let guid = attribute_value(&e, "GUID")?;
+                    let alter_id = attribute_value(&e, "ALTERID")?
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    if let Some(n) = name {
+                        if !n.trim().is_empty() && !companies.iter().any(|c: &DiscoveredCompany| c.company_name.eq_ignore_ascii_case(&n)) {
+                            companies.push(DiscoveredCompany {
+                                company_name: n,
+                                alter_id,
+                                company_guid: guid.filter(|g| !g.trim().is_empty()),
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(TallyError::MalformedXml(e.to_string())),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(companies)
 }
 
 fn parse_company_info_common(xml: &str) -> Result<CompanyInfo, TallyError> {
@@ -554,5 +674,64 @@ mod tests {
         assert_eq!(ledgers[0].parent, "Bank Accounts");
         assert_eq!(ledgers[0].alter_id, 990);
         assert_eq!(ledgers[0].opening_balance, Some(125000.00));
+    }
+
+    #[test]
+    fn parse_multi_company_discovery_xml() {
+        let xml = r#"<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYPRIME>1</TALLYPRIME>
+  </HEADER>
+  <BODY>
+    <DATA>
+      <COLLECTION>
+        <COMPANY NAME="DemoCorp" GUID="guid-demo-111">
+          <NAME>DemoCorp</NAME>
+          <ALTERID>230</ALTERID>
+          <GUID>guid-demo-111</GUID>
+        </COMPANY>
+        <COMPANY NAME="ThunderClaps" GUID="guid-thunder-222">
+          <NAME>ThunderClaps</NAME>
+          <ALTERID>55</ALTERID>
+          <GUID>guid-thunder-222</GUID>
+        </COMPANY>
+      </COLLECTION>
+    </DATA>
+  </BODY>
+</ENVELOPE>"#;
+
+        let adapter = PrimeAdapter;
+        let companies = adapter.parse_company_list(xml).expect("parse company list");
+        assert_eq!(companies.len(), 2);
+        assert_eq!(companies[0].company_name, "DemoCorp");
+        assert_eq!(companies[0].alter_id, 230);
+        assert_eq!(companies[0].company_guid.as_deref(), Some("guid-demo-111"));
+
+        assert_eq!(companies[1].company_name, "ThunderClaps");
+        assert_eq!(companies[1].alter_id, 55);
+        assert_eq!(companies[1].company_guid.as_deref(), Some("guid-thunder-222"));
+    }
+
+    #[test]
+    fn parse_single_company_discovery_xml() {
+        let xml = r#"<ENVELOPE>
+  <BODY>
+    <DATA>
+      <COLLECTION>
+        <COMPANY NAME="Solo Corp" GUID="guid-solo-999">
+          <ALTERID>12</ALTERID>
+        </COMPANY>
+      </COLLECTION>
+    </DATA>
+  </BODY>
+</ENVELOPE>"#;
+
+        let adapter = Erp9Adapter;
+        let companies = adapter.parse_company_list(xml).expect("parse company list");
+        assert_eq!(companies.len(), 1);
+        assert_eq!(companies[0].company_name, "Solo Corp");
+        assert_eq!(companies[0].alter_id, 12);
+        assert_eq!(companies[0].company_guid.as_deref(), Some("guid-solo-999"));
     }
 }

@@ -26,7 +26,7 @@ pub enum TallyError {
     #[error("Missing ALTERID in Tally response")]
     MissingAlterId,
 
-    #[error("Tally active company '{current}' does not match paired company '{expected}'")]
+    #[error("Open '{expected}' in Tally to sync this company (currently open in Tally: '{current}')")]
     CompanyMismatch { current: String, expected: String },
 }
 

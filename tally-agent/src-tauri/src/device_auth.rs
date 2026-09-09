@@ -239,14 +239,20 @@ pub async fn poll_device_auth(
         .to_ascii_lowercase();
 
     match status_str.as_str() {
-        "pending" | "authorization_pending" => Ok(DeviceAuthStatus::Pending),
+        "pending" | "authorization_pending" | "waiting" => Ok(DeviceAuthStatus::Pending),
         "slow_down" | "slowdown" => Ok(DeviceAuthStatus::SlowDown),
-        "denied" | "access_denied" => Ok(DeviceAuthStatus::Denied),
+        "denied" | "access_denied" | "rejected" | "canceled" | "cancelled" => Ok(DeviceAuthStatus::Denied),
         "expired" | "expired_token" => Ok(DeviceAuthStatus::Expired),
-        "approved" => {
+        "approved" | "completed" | "already_completed" | "already_approved" | "consumed" | "finalized" | "paired" => {
             if let Some(token) = resp.extract_token() {
                 Ok(DeviceAuthStatus::Approved {
                     agent_token: token,
+                    connection_id: resp.extract_connection_id(),
+                })
+            } else if status_str == "already_completed" || status_str == "already_approved" || status_str == "completed" {
+                // Return Approved with empty token or existing connection id if already completed
+                Ok(DeviceAuthStatus::Approved {
+                    agent_token: String::new(),
                     connection_id: resp.extract_connection_id(),
                 })
             } else {

@@ -14,6 +14,7 @@ pub enum EnvelopeDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportReport {
     CompanyInfo,
+    CompanyList,
     Ledgers,
     Groups,
     Vouchers,
@@ -186,9 +187,66 @@ impl ExportEnvelope {
 </ENVELOPE>"#
                 )
             }
+            ExportReport::CompanyInfo => {
+                let coll_name = "FinInsightActiveCompanyColl";
+                format!(
+                    r#"<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>{coll_name}</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="{coll_name}" ISMODIFY="No">
+            <TYPE>Company</TYPE>
+            <FETCH>NAME, ALTERID, GUID</FETCH>
+            <FILTER>FinInsightActiveFilter</FILTER>
+          </COLLECTION>
+          <SYSTEM TYPE="Formulae" NAME="FinInsightActiveFilter">$Name = $$CurrentCompany</SYSTEM>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>"#
+                )
+            }
+            ExportReport::CompanyList => {
+                let coll_name = "Collection of Companies";
+                format!(
+                    r#"<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>{coll_name}</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="{coll_name}" ISMODIFY="No">
+            <TYPE>Company</TYPE>
+            <FETCH>NAME, ALTERID, GUID</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>"#
+                )
+            }
             _ => {
                 let (collection_name, entity_type, fetch_fields) = match report {
-                    ExportReport::CompanyInfo => ("Collection of Companies", "Company", "NAME, ALTERID, GUID"),
                     ExportReport::Ledgers => ("Ledgers", "Ledger", "NAME, PARENT, ALTERID, OPENINGBALANCE, GUID, MASTERID"),
                     ExportReport::Groups => ("Groups", "Group", "NAME, PARENT, ALTERID, GUID, MASTERID"),
                     ExportReport::Vouchers => ("Vouchers", "Voucher", "VOUCHERNUMBER, VOUCHERTYPENAME, DATE, ALTERID, AMOUNT, PARTYLEDGERNAME, PARTYNAME, GUID, MASTERID"),
@@ -236,6 +294,11 @@ impl ExportEnvelope {
     pub fn ping() -> Self {
         Self::build(ExportReport::CompanyInfo, None)
     }
+
+    /// Company discovery envelope to query all open companies in Tally.
+    pub fn discover_companies() -> Self {
+        Self::build(ExportReport::CompanyList, None)
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +316,7 @@ mod tests {
     fn all_envelopes_contain_export_request_type() {
         for report in [
             ExportReport::CompanyInfo,
+            ExportReport::CompanyList,
             ExportReport::Ledgers,
             ExportReport::Groups,
             ExportReport::Vouchers,

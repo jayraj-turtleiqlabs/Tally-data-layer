@@ -7,11 +7,12 @@ use reqwest::Client;
 use crate::errors::TallyError;
 use crate::tally_envelope::{ExportEnvelope, ExportReport};
 use crate::tally_schema::{
-    adapter_for_xml, CompanyInfo, DeltaRecord, LedgerRecord, VoucherRecord,
+    adapter_for_xml, CompanyInfo, DeltaRecord, DiscoveredCompany, LedgerRecord, VoucherRecord,
 };
 
 const DEFAULT_TALLY_PORT: u16 = 9000;
 const PING_TIMEOUT_SECS: u64 = 5;
+const DISCOVERY_TIMEOUT_SECS: u64 = 8;
 const DEFAULT_EXPORT_TIMEOUT_SECS: u64 = 120;
 
 /// Validated loopback-only Tally endpoint. Cannot be constructed with a remote host.
@@ -96,6 +97,14 @@ impl TallyClient {
         let xml = self.send_export(&envelope, PING_TIMEOUT_SECS).await?;
         let adapter = adapter_for_xml(&xml);
         adapter.parse_company_info(&xml)
+    }
+
+    /// Discover all loaded/open companies in the running Tally instance.
+    pub async fn discover_companies(&self) -> Result<Vec<DiscoveredCompany>, TallyError> {
+        let envelope = ExportEnvelope::discover_companies();
+        let xml = self.send_export(&envelope, DISCOVERY_TIMEOUT_SECS).await?;
+        let adapter = adapter_for_xml(&xml);
+        adapter.parse_company_list(&xml)
     }
 
     pub async fn export_ledgers(&self) -> Result<Vec<LedgerRecord>, TallyError> {

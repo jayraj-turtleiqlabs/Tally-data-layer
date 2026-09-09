@@ -1,14 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 
-interface AgentStatus {
-  paired: boolean;
-  company_name: string | null;
-  tally_reachable: boolean;
-  sync_idle: boolean;
-  sync_in_progress: boolean;
-  last_successful_sync: string | null;
-  last_error: string | null;
+interface CompanyItem {
+  company_name: string;
+  company_guid?: string | null;
+  alter_id: number;
+  is_active_in_tally: boolean;
+  is_connected: boolean;
+  connection_id?: string | null;
+  status: string;
+  last_successful_sync?: string | null;
   last_known_alter_id: number;
+  last_error?: string | null;
+  sync_in_progress: boolean;
   backfill_complete: boolean;
 }
 
@@ -18,31 +21,25 @@ interface DeviceAuthPublicSession {
   browser_opened: boolean;
 }
 
-const pairSection = document.getElementById("pair-section")!;
-const pairDefaultView = document.getElementById("pair-default-view")!;
-const browserAuthView = document.getElementById("browser-auth-view")!;
-const pairedSection = document.getElementById("paired-section")!;
-const connectionBadge = document.getElementById("connection-badge")!;
+const tallyStatusBadge = document.getElementById("tally-status-badge")!;
+const refreshBtn = document.getElementById("refresh-btn") as HTMLButtonElement;
+const discoveringIndicator = document.getElementById("discovering-indicator")!;
+const companiesList = document.getElementById("companies-list")!;
+const emptyState = document.getElementById("empty-state")!;
+const emptyRefreshBtn = document.getElementById("empty-refresh-btn") as HTMLButtonElement;
 
-const browserLoginBtn = document.getElementById("browser-login-btn") as HTMLButtonElement;
+// Auth modal elements
+const authModal = document.getElementById("auth-modal")!;
+const authModalTitle = document.getElementById("auth-modal-title")!;
 const userCodeDisplay = document.getElementById("user-code-display")!;
 const browserAuthStatus = document.getElementById("browser-auth-status")!;
 const browserAuthLink = document.getElementById("browser-auth-link") as HTMLAnchorElement;
 const browserAuthError = document.getElementById("browser-auth-error")!;
 const cancelBrowserBtn = document.getElementById("cancel-browser-btn") as HTMLButtonElement;
-const pairError = document.getElementById("pair-error")!;
 
-const companyName = document.getElementById("company-name")!;
-const tallyStatus = document.getElementById("tally-status")!;
-const lastSync = document.getElementById("last-sync")!;
-const alterId = document.getElementById("alter-id")!;
-const syncError = document.getElementById("sync-error")!;
-const syncBtn = document.getElementById("sync-btn") as HTMLButtonElement;
-const disconnectBtn = document.getElementById("disconnect-btn") as HTMLButtonElement;
+let isPollingAuth = false;
 
-let isPollingDeviceAuth = false;
-
-function formatDate(iso: string | null): string {
+function formatDate(iso?: string | null): string {
   if (!iso) return "Never";
   try {
     return new Date(iso).toLocaleString();
@@ -51,100 +48,206 @@ function formatDate(iso: string | null): string {
   }
 }
 
-function setBadge(status: AgentStatus) {
-  connectionBadge.className = "badge";
-  if (status.sync_in_progress) {
-    connectionBadge.textContent = "Syncing…";
-    connectionBadge.classList.add("badge-syncing");
-  } else if (status.last_error && status.paired) {
-    connectionBadge.textContent = "Error";
-    connectionBadge.classList.add("badge-error");
-  } else if (status.paired) {
-    connectionBadge.textContent = "Paired";
-    connectionBadge.classList.add("badge-paired");
+function updateTallyBadge(companies: CompanyItem[]) {
+  const isReachable = companies.some((c) => c.status !== "Offline");
+  tallyStatusBadge.className = "badge";
+  if (isReachable) {
+    tallyStatusBadge.textContent = "● Tally Reachable";
+    tallyStatusBadge.classList.add("badge-paired");
   } else {
-    connectionBadge.textContent = "Not paired";
-    connectionBadge.classList.add("badge-unpaired");
+    tallyStatusBadge.textContent = "○ Tally Offline";
+    tallyStatusBadge.classList.add("badge-error");
   }
 }
 
-function renderStatus(status: AgentStatus) {
-  setBadge(status);
+function renderCompanies(companies: CompanyItem[]) {
+  updateTallyBadge(companies);
+  companiesList.innerHTML = "";
 
-  if (status.paired) {
-    pairSection.classList.add("hidden");
-    pairedSection.classList.remove("hidden");
-    companyName.textContent = status.company_name ?? "Connected company";
-    tallyStatus.textContent = status.tally_reachable ? "Reachable" : "Unreachable";
-    lastSync.textContent = formatDate(status.last_successful_sync);
-    alterId.textContent = String(status.last_known_alter_id);
+  if (companies.length === 0) {
+    companiesList.classList.add("hidden");
+    emptyState.classList.remove("hidden");
+    return;
+  }
 
-    if (status.last_error) {
-      syncError.textContent = status.last_error;
-      syncError.classList.remove("hidden");
+  emptyState.classList.add("hidden");
+  companiesList.classList.remove("hidden");
+
+  for (const company of companies) {
+    const card = document.createElement("div");
+    card.className = "card company-card";
+
+    if (company.is_connected) {
+      // Connected Card
+      const isOnlineActive = company.is_active_in_tally && company.status.includes("Active");
+      const isOffline = company.status === "Offline" || company.status.includes("Offline");
+      const isSyncing = company.sync_in_progress;
+
+      let badgeClass = "badge-paired";
+      let statusLabel = "● Connected · Active";
+
+      if (isOffline) {
+        badgeClass = "badge-error";
+        statusLabel = "○ Offline";
+      } else if (isSyncing) {
+        badgeClass = "badge-syncing";
+        statusLabel = "⏳ Syncing…";
+      } else if (!company.is_active_in_tally) {
+        badgeClass = "badge-unpaired";
+        statusLabel = "○ Connected · Inactive";
+      }
+
+      card.innerHTML = `
+        <div class="company-card-header">
+          <div>
+            <h3 class="company-title">${escapeHtml(company.company_name)}</h3>
+            <span class="company-meta">${company.company_guid ? `GUID: ${escapeHtml(company.company_guid)}` : "Tally"}</span>
+          </div>
+          <span class="badge ${badgeClass}">${statusLabel}</span>
+        </div>
+
+        ${!company.is_active_in_tally && !isOffline ? `<p class="inactive-hint">Tally currently has another company open. Open ${escapeHtml(company.company_name)} in Tally to sync.</p>` : ""}
+
+        <dl class="status-grid">
+          <dt>Last sync</dt>
+          <dd>${formatDate(company.last_successful_sync)}</dd>
+          <dt>Checkpoint</dt>
+          <dd>${company.last_known_alter_id}</dd>
+        </dl>
+
+        ${company.last_error ? `<div class="error-banner">${escapeHtml(company.last_error)}</div>` : ""}
+
+        <div class="card-actions">
+          <button class="btn primary sync-company-btn" data-cid="${company.connection_id}" ${!isOnlineActive || isSyncing ? "disabled" : ""} title="${!isOnlineActive ? `Open ${escapeHtml(company.company_name)} in Tally to sync` : ""}">
+            ${isSyncing ? "Syncing…" : "Sync Now"}
+          </button>
+          <button class="btn secondary disconnect-company-btn" data-cid="${company.connection_id}" data-name="${escapeHtml(company.company_name)}">
+            Disconnect
+          </button>
+        </div>
+      `;
     } else {
-      syncError.classList.add("hidden");
+      // Discovered / Unconnected Card
+      const isOnlineActive = company.is_active_in_tally;
+      const statusLabel = isOnlineActive ? "● Found in Tally · Not connected" : "○ Found in Tally · Not connected";
+      const badgeClass = isOnlineActive ? "badge-paired" : "badge-idle";
+
+      card.innerHTML = `
+        <div class="company-card-header">
+          <div>
+            <h3 class="company-title">${escapeHtml(company.company_name)}</h3>
+            <span class="company-meta">${company.company_guid ? `GUID: ${escapeHtml(company.company_guid)}` : "Tally"}</span>
+          </div>
+          <span class="badge ${badgeClass}">${statusLabel}</span>
+        </div>
+
+        <p class="available-hint">${isOnlineActive ? "Currently active in Tally" : "Open in Tally background"}</p>
+
+        <div class="card-actions">
+          <button class="btn primary connect-company-btn" data-name="${escapeHtml(company.company_name)}" data-guid="${escapeHtml(company.company_guid || "")}">
+            Connect
+          </button>
+        </div>
+      `;
     }
 
-    syncBtn.disabled = status.sync_in_progress;
-    syncBtn.textContent = status.sync_in_progress ? "Syncing…" : "Sync Now";
-  } else {
-    pairSection.classList.remove("hidden");
-    pairedSection.classList.add("hidden");
-
-    if (status.last_error) {
-      pairError.textContent = status.last_error;
-      pairError.classList.remove("hidden");
-    }
+    companiesList.appendChild(card);
   }
+
+  attachCardEvents();
 }
 
-async function refreshStatus() {
-  try {
-    const status = await invoke<AgentStatus>("get_agent_status");
-    renderStatus(status);
-  } catch {
-    connectionBadge.textContent = "Error";
-    connectionBadge.className = "badge badge-error";
-  }
+function escapeHtml(text: string): string {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
 }
 
-function resetBrowserAuthView() {
-  isPollingDeviceAuth = false;
-  browserAuthView.classList.add("hidden");
-  pairDefaultView.classList.remove("hidden");
+function attachCardEvents() {
+  // Sync buttons
+  document.querySelectorAll(".sync-company-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const target = e.currentTarget as HTMLButtonElement;
+      const cid = target.getAttribute("data-cid");
+      if (!cid) return;
+
+      target.disabled = true;
+      target.textContent = "Syncing…";
+
+      try {
+        await invoke("sync_company", { connectionId: cid });
+      } catch (err) {
+        console.error("Sync failed:", err);
+      } finally {
+        await loadCompaniesCached();
+      }
+    });
+  });
+
+  // Disconnect buttons
+  document.querySelectorAll(".disconnect-company-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const target = e.currentTarget as HTMLButtonElement;
+      const cid = target.getAttribute("data-cid");
+      const name = target.getAttribute("data-name") || "this company";
+      if (!cid) return;
+
+      if (!confirm(`Disconnect ${name}? Checkpoints will be preserved.`)) return;
+
+      try {
+        await invoke("disconnect_company", { connectionId: cid });
+      } catch (err) {
+        console.error("Disconnect failed:", err);
+      } finally {
+        await loadCompaniesCached();
+      }
+    });
+  });
+
+  // Connect buttons
+  document.querySelectorAll(".connect-company-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const target = e.currentTarget as HTMLButtonElement;
+      const name = target.getAttribute("data-name");
+      const guid = target.getAttribute("data-guid") || null;
+      if (!name) return;
+
+      await startConnectCompany(name, guid);
+    });
+  });
+}
+
+async function startConnectCompany(companyName: string, companyGuid?: string | null) {
+  authModalTitle.textContent = `Connect ${companyName}`;
   browserAuthError.classList.add("hidden");
-  browserLoginBtn.disabled = false;
-}
-
-browserLoginBtn.addEventListener("click", async () => {
-  browserLoginBtn.disabled = true;
-  pairError.classList.add("hidden");
-  browserAuthError.classList.add("hidden");
+  browserAuthStatus.textContent = "Waiting for you to approve in your browser…";
+  authModal.classList.remove("hidden");
 
   try {
-    const session = await invoke<DeviceAuthPublicSession>("initiate_device_login");
-    
-    // Switch to browser auth view
-    pairDefaultView.classList.add("hidden");
-    browserAuthView.classList.remove("hidden");
-    
+    const session = await invoke<DeviceAuthPublicSession>("initiate_company_connection", {
+      companyName,
+      companyGuid: companyGuid || null,
+    });
+
     userCodeDisplay.textContent = session.user_code;
     browserAuthLink.href = session.verification_uri;
-    browserAuthStatus.textContent = "Waiting for you to approve in your browser…";
-    isPollingDeviceAuth = true;
+    isPollingAuth = true;
 
-    // Start polling backend for approval
     try {
-      const company = await invoke<string>("poll_device_login");
-      if (isPollingDeviceAuth) {
-        browserAuthStatus.textContent = "Approved! Setting up your connection…";
-        companyName.textContent = company;
-        await refreshStatus();
-        resetBrowserAuthView();
+      await invoke<string>("poll_company_connection", {
+        companyName,
+        companyGuid: companyGuid || null,
+      });
+
+      if (isPollingAuth) {
+        browserAuthStatus.textContent = "Approved! Initializing connection…";
+        setTimeout(() => {
+          closeAuthModal();
+          refreshCompaniesReal();
+        }, 800);
       }
     } catch (pollErr) {
-      if (isPollingDeviceAuth) {
+      if (isPollingAuth) {
         const errorMsg = typeof pollErr === "string" ? pollErr : "Login was denied or expired — try again";
         browserAuthError.textContent = errorMsg;
         browserAuthError.classList.remove("hidden");
@@ -152,43 +255,58 @@ browserLoginBtn.addEventListener("click", async () => {
       }
     }
   } catch (initErr) {
-    const errorMsg = typeof initErr === "string" ? initErr : "Failed to start browser login. Ensure Tally is running.";
-    pairError.textContent = errorMsg;
-    pairError.classList.remove("hidden");
-    browserLoginBtn.disabled = false;
+    const errorMsg = typeof initErr === "string" ? initErr : "Failed to initiate connection. Ensure Tally is running.";
+    browserAuthError.textContent = errorMsg;
+    browserAuthError.classList.remove("hidden");
+    browserAuthStatus.textContent = "Initialization failed";
   }
+}
+
+function closeAuthModal() {
+  isPollingAuth = false;
+  authModal.classList.add("hidden");
+  invoke("cancel_device_login").catch(() => {});
+}
+
+cancelBrowserBtn.addEventListener("click", () => {
+  closeAuthModal();
 });
 
-cancelBrowserBtn.addEventListener("click", async () => {
-  isPollingDeviceAuth = false;
+async function loadCompaniesCached() {
   try {
-    await invoke("cancel_device_login");
-  } catch {
-    // Ignore cancel errors
-  }
-  resetBrowserAuthView();
-});
-
-syncBtn.addEventListener("click", async () => {
-  syncBtn.disabled = true;
-  syncError.classList.add("hidden");
-
-  try {
-    await invoke("sync_now");
+    const companies = await invoke<CompanyItem[]>("get_companies");
+    renderCompanies(companies);
   } catch (e) {
-    syncError.textContent =
-      typeof e === "string" ? e : "Sync failed. Please try again.";
-    syncError.classList.remove("hidden");
-  } finally {
-    await refreshStatus();
+    console.error("Failed to load cached companies:", e);
   }
+}
+
+async function refreshCompaniesReal() {
+  discoveringIndicator.classList.remove("hidden");
+  refreshBtn.disabled = true;
+
+  try {
+    const companies = await invoke<CompanyItem[]>("refresh_companies");
+    renderCompanies(companies);
+  } catch (e) {
+    console.error("Failed to refresh companies:", e);
+  } finally {
+    discoveringIndicator.classList.add("hidden");
+    refreshBtn.disabled = false;
+  }
+}
+
+refreshBtn.addEventListener("click", () => {
+  refreshCompaniesReal();
 });
 
-disconnectBtn.addEventListener("click", async () => {
-  if (!confirm("Disconnect this agent and clear pairing?")) return;
-  await invoke("disconnect_agent");
-  await refreshStatus();
+emptyRefreshBtn.addEventListener("click", () => {
+  refreshCompaniesReal();
 });
 
-refreshStatus();
-setInterval(refreshStatus, 5000);
+// Initialize on app startup
+refreshCompaniesReal();
+
+// Fast local UI polling from in-memory cache without hammering Tally
+setInterval(loadCompaniesCached, 5000);
+

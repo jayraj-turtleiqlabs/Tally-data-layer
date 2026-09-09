@@ -48,28 +48,123 @@ impl ProfileStore {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("FinInsight")
             .join("TallyAgent")
-            .join("profile.json")
+            .join("profiles.json")
+    }
+
+    pub fn legacy_path_in_dir(base_dir: &Path) -> PathBuf {
+        base_dir.join("profile.json")
+    }
+
+    pub fn load_all(&self) -> Result<Vec<ConnectionProfile>, ProfileError> {
+        if self.path.exists() {
+            let data = fs::read_to_string(&self.path)
+                .map_err(|e| ProfileError::Read(e.to_string()))?;
+            let trimmed = data.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Try parsing as array of profiles first
+            if let Ok(profiles) = serde_json::from_str::<Vec<ConnectionProfile>>(trimmed) {
+                return Ok(profiles);
+            }
+            // Fallback: try parsing as single profile if old file format was placed at this path
+            if let Ok(single) = serde_json::from_str::<ConnectionProfile>(trimmed) {
+                let profiles = vec![single];
+                let _ = self.save_all(&profiles);
+                return Ok(profiles);
+            }
+            return Err(ProfileError::Read("Failed to parse profiles JSON".into()));
+        }
+
+        // Check for legacy single profile.json in same parent folder
+        if let Some(parent) = self.path.parent() {
+            let legacy = Self::legacy_path_in_dir(parent);
+            if legacy.exists() && legacy != self.path {
+                if let Ok(data) = fs::read_to_string(&legacy) {
+                    let trimmed = data.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+                    if !trimmed.is_empty() {
+                        if let Ok(single) = serde_json::from_str::<ConnectionProfile>(trimmed) {
+                            let profiles = vec![single];
+                            let _ = self.save_all(&profiles);
+                            return Ok(profiles);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     pub fn load(&self) -> Result<Option<ConnectionProfile>, ProfileError> {
-        if !self.path.exists() {
-            return Ok(None);
+        let profiles = self.load_all()?;
+        Ok(profiles.into_iter().next())
+    }
+
+    pub fn get_by_connection_id(&self, cid: &str) -> Result<Option<ConnectionProfile>, ProfileError> {
+        let profiles = self.load_all()?;
+        Ok(profiles.into_iter().find(|p| p.connection_id == cid))
+    }
+
+    pub fn get_by_guid_or_name(&self, guid: Option<&str>, name: &str) -> Result<Option<ConnectionProfile>, ProfileError> {
+        let profiles = self.load_all()?;
+        let trimmed_guid = guid.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        if let Some(g) = trimmed_guid {
+            // GUID is available: STRICT GUID lookup only. Do not fall back to name if GUID is present!
+            let matched = profiles.into_iter().find(|p| {
+                p.company_guid.as_deref().map(|s| s.trim()) == Some(g)
+            });
+            return Ok(matched);
         }
-        let data = fs::read_to_string(&self.path)
-            .map_err(|e| ProfileError::Read(e.to_string()))?;
-        let trimmed = data.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-        if trimmed.is_empty() {
-            return Ok(None);
+
+        // GUID is unavailable (legacy profile):
+        // Name fallback ONLY if exactly ONE existing profile matches.
+        let matching_by_name: Vec<ConnectionProfile> = profiles
+            .into_iter()
+            .filter(|p| p.company_name.trim().eq_ignore_ascii_case(name.trim()))
+            .collect();
+
+        match matching_by_name.len() {
+            1 => Ok(Some(matching_by_name.into_iter().next().unwrap())),
+            0 => Ok(None),
+            _ => {
+                log::warn!(
+                    "[profile] Ambiguous company name '{}' matches multiple ({} profiles) without GUID. Refusing to guess.",
+                    name,
+                    matching_by_name.len()
+                );
+                Err(ProfileError::Read(format!(
+                    "Ambiguous company name '{}' matched multiple profiles without GUID",
+                    name
+                )))
+            }
         }
-        let profile = serde_json::from_str(trimmed)
-            .map_err(|e| ProfileError::Read(e.to_string()))?;
-        Ok(Some(profile))
+    }
+
+    pub fn save_all(&self, profiles: &[ConnectionProfile]) -> Result<(), ProfileError> {
+        let data = serde_json::to_string_pretty(profiles)
+            .map_err(|e| ProfileError::Write(e.to_string()))?;
+        atomic_write(&self.path, &data).map_err(|e| ProfileError::Write(e.to_string()))
     }
 
     pub fn save(&self, profile: &ConnectionProfile) -> Result<(), ProfileError> {
-        let data = serde_json::to_string_pretty(profile)
-            .map_err(|e| ProfileError::Write(e.to_string()))?;
-        atomic_write(&self.path, &data).map_err(|e| ProfileError::Write(e.to_string()))
+        let mut profiles = self.load_all().unwrap_or_default();
+        if let Some(pos) = profiles.iter().position(|p| {
+            p.connection_id == profile.connection_id
+                || (profile.company_guid.is_some() && p.company_guid == profile.company_guid)
+        }) {
+            profiles[pos] = profile.clone();
+        } else {
+            profiles.push(profile.clone());
+        }
+        self.save_all(&profiles)
+    }
+
+    pub fn delete_for_connection(&self, connection_id: &str) -> Result<(), ProfileError> {
+        let mut profiles = self.load_all().unwrap_or_default();
+        profiles.retain(|p| p.connection_id != connection_id);
+        self.save_all(&profiles)
     }
 
     pub fn delete(&self) -> Result<(), ProfileError> {
@@ -271,10 +366,11 @@ mod tests {
     #[test]
     fn profile_store_atomic_roundtrip() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("profile.json");
+        let path = dir.path().join("profiles.json");
         let store = ProfileStore::new(path.clone());
 
         assert_eq!(store.load().unwrap(), None);
+        assert_eq!(store.load_all().unwrap(), Vec::new());
 
         let profile = ConnectionProfile {
             connection_id: "conn-123".into(),
@@ -287,8 +383,76 @@ mod tests {
         let loaded = store.load().unwrap().expect("profile must exist");
         assert_eq!(loaded, profile);
 
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0], profile);
+
+        // Add second profile
+        let profile2 = ConnectionProfile {
+            connection_id: "conn-456".into(),
+            company_guid: Some("guid-thunder-789".into()),
+            company_name: "ThunderClaps".into(),
+            paired_at: "2026-09-09T11:00:00Z".into(),
+        };
+        store.save(&profile2).unwrap();
+
+        let all2 = store.load_all().unwrap();
+        assert_eq!(all2.len(), 2);
+        assert_eq!(store.get_by_connection_id("conn-456").unwrap().unwrap().company_name, "ThunderClaps");
+        assert_eq!(store.get_by_guid_or_name(Some("guid-abc-xyz"), "Acme Corp").unwrap().unwrap().connection_id, "conn-123");
+
+        // Strict isolation: if a different GUID is requested, name must NOT match
+        assert_eq!(store.get_by_guid_or_name(Some("guid-other-999"), "Acme Corp").unwrap(), None);
+
+        // Name fallback when GUID is None/unavailable
+        assert_eq!(store.get_by_guid_or_name(None, "ThunderClaps").unwrap().unwrap().connection_id, "conn-456");
+
+        // Ambiguity test: two profiles with same name without GUID match
+        let duplicate_named = ConnectionProfile {
+            connection_id: "conn-dup".into(),
+            company_guid: None,
+            company_name: "Acme Corp".into(),
+            paired_at: "2026-09-09T12:00:00Z".into(),
+        };
+        store.save(&duplicate_named).unwrap();
+        // Looking up with None GUID for "Acme Corp" should fail closed as ambiguous
+        assert!(store.get_by_guid_or_name(None, "Acme Corp").is_err());
+
+        // Delete one connection
+        store.delete_for_connection("conn-123").unwrap();
+        store.delete_for_connection("conn-dup").unwrap();
+        let all3 = store.load_all().unwrap();
+        assert_eq!(all3.len(), 1);
+        assert_eq!(all3[0].connection_id, "conn-456");
+
         store.delete().unwrap();
         assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[test]
+    fn profile_store_migrates_legacy_profile_json() {
+        let dir = tempdir().unwrap();
+        let legacy_path = dir.path().join("profile.json");
+        let modern_path = dir.path().join("profiles.json");
+
+        let legacy_profile = ConnectionProfile {
+            connection_id: "legacy-conn-1".into(),
+            company_guid: Some("guid-legacy-100".into()),
+            company_name: "Legacy Corp".into(),
+            paired_at: "2026-09-08T09:00:00Z".into(),
+        };
+        fs::write(&legacy_path, serde_json::to_string(&legacy_profile).unwrap()).unwrap();
+
+        let store = ProfileStore::new(modern_path.clone());
+        assert!(!modern_path.exists());
+
+        let loaded_all = store.load_all().unwrap();
+        assert_eq!(loaded_all.len(), 1);
+        assert_eq!(loaded_all[0].company_name, "Legacy Corp");
+        assert_eq!(loaded_all[0].connection_id, "legacy-conn-1");
+
+        // After migration, modern path exists
+        assert!(modern_path.exists());
     }
 
     #[test]
