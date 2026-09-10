@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::cloud_client::CloudClient;
 use crate::errors::ApiError;
 use crate::redact::redact;
-use crate::vault::Vault;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceAuthStatus {
@@ -172,6 +171,15 @@ pub async fn initiate_device_auth(
     cloud_client: &CloudClient,
     company_name: &str,
 ) -> Result<DeviceAuthSession, ApiError> {
+    initiate_device_auth_with_prev_cid(cloud_client, company_name, None).await
+}
+
+/// Request a new device authorization session with an optional previous_connection_id for re-pairing the same company.
+pub async fn initiate_device_auth_with_prev_cid(
+    cloud_client: &CloudClient,
+    company_name: &str,
+    previous_connection_id: Option<String>,
+) -> Result<DeviceAuthSession, ApiError> {
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok();
@@ -188,8 +196,7 @@ pub async fn initiate_device_auth(
         hostname.clone().unwrap_or_default()
     };
 
-    let previous_connection_id = Vault::get_connection_id()
-        .ok()
+    let prev_cid = previous_connection_id
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
@@ -206,7 +213,7 @@ pub async fn initiate_device_auth(
         } else {
             None
         },
-        previous_connection_id,
+        previous_connection_id: prev_cid,
     };
 
     let resp = cloud_client.initiate_device(&request).await?;

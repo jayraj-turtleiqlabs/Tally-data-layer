@@ -57,13 +57,12 @@
         <div id="companies-list" class="companies-container">
           <!-- Dynamic company cards rendered by main.ts -->
         </div>
-
-        <div id="empty-state" class="empty-card hidden">
-          <p class="empty-title">No Tally Companies Detected</p>
-          <p class="empty-hint">Please make sure Tally is open on your PC with a company loaded, then click Refresh.</p>
-          <button id="empty-refresh-btn" class="btn primary">Check Tally Now</button>
-        </div>
       </main>
+
+      <!-- Non-blocking toast notification -->
+      <div id="toast" class="toast hidden" role="status" aria-live="polite">
+        <span id="toast-message">Tally is not running</span>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

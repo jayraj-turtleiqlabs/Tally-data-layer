@@ -1842,9 +1842,9 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
 
     assert_eq!(demo_a.status, "Connected · Active");
     assert_eq!(demo_a.is_active_in_tally, true);
-    assert_eq!(thunder_a.status, "Connected · Inactive in Tally");
+    assert_eq!(thunder_a.status, "Connected · Inactive");
     assert_eq!(thunder_a.is_active_in_tally, false);
-    assert_eq!(wiresnaks_a.status, "Available · Not Active");
+    assert_eq!(wiresnaks_a.status, "Available · Inactive");
     assert_eq!(wiresnaks_a.is_active_in_tally, false);
 
     // Transition B: User switches active company in Tally to ThunderClaps
@@ -1856,11 +1856,11 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
     let thunder_b = items_b.iter().find(|i| i.company_name == "ThunderClaps").unwrap();
     let wiresnaks_b = items_b.iter().find(|i| i.company_name == "WireSnaks").unwrap();
 
-    assert_eq!(demo_b.status, "Connected · Inactive in Tally");
+    assert_eq!(demo_b.status, "Connected · Inactive");
     assert_eq!(demo_b.is_active_in_tally, false);
     assert_eq!(thunder_b.status, "Connected · Active");
     assert_eq!(thunder_b.is_active_in_tally, true);
-    assert_eq!(wiresnaks_b.status, "Available · Not Active");
+    assert_eq!(wiresnaks_b.status, "Available · Inactive");
     assert_eq!(wiresnaks_b.is_active_in_tally, false);
 
     // Transition C: User switches active company in Tally to WireSnaks (unconnected)
@@ -1872,9 +1872,9 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
     let thunder_c = items_c.iter().find(|i| i.company_name == "ThunderClaps").unwrap();
     let wiresnaks_c = items_c.iter().find(|i| i.company_name == "WireSnaks").unwrap();
 
-    assert_eq!(demo_c.status, "Connected · Inactive in Tally");
+    assert_eq!(demo_c.status, "Connected · Inactive");
     assert_eq!(demo_c.is_active_in_tally, false);
-    assert_eq!(thunder_c.status, "Connected · Inactive in Tally");
+    assert_eq!(thunder_c.status, "Connected · Inactive");
     assert_eq!(thunder_c.is_active_in_tally, false);
     assert_eq!(wiresnaks_c.status, "Available · Active");
     assert_eq!(wiresnaks_c.is_active_in_tally, true);
@@ -1890,9 +1890,389 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
 
     assert_eq!(demo_d.status, "Connected · Active");
     assert_eq!(demo_d.is_active_in_tally, true);
-    assert_eq!(thunder_d.status, "Connected · Inactive in Tally");
+    assert_eq!(thunder_d.status, "Connected · Inactive");
     assert_eq!(thunder_d.is_active_in_tally, false);
-    assert_eq!(wiresnaks_d.status, "Available · Not Active");
+    assert_eq!(wiresnaks_d.status, "Available · Inactive");
     assert_eq!(wiresnaks_d.is_active_in_tally, false);
 }
+
+#[tokio::test]
+async fn test_multicompany_democorp_profitcorp_thunderclaps_full_lifecycle() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profiles_file = dir.path().join("profiles.json");
+
+    let cloud_server = MockServer::start().await;
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        profiles_file.clone(),
+    )
+    .unwrap();
+
+    // 1. Connect DemoCorp
+    agent_state
+        .complete_pairing_for_company(
+            "conn-demo-111",
+            "token-demo-secret-111",
+            "DemoCorp",
+            Some("guid-demo-111"),
+        )
+        .await
+        .unwrap();
+
+    // Set DemoCorp checkpoint to 207 with backfill complete
+    let cp_store_demo = CheckpointStore::for_connection_in_dir(dir.path(), "conn-demo-111");
+    cp_store_demo
+        .advance_on_ack(207, true)
+        .unwrap();
+
+    assert_eq!(cp_store_demo.load().unwrap().last_known_alter_id, 207);
+    assert_eq!(Vault::get_token_for("conn-demo-111").unwrap(), "token-demo-secret-111");
+
+    // 2. Connect ProfitCorp afterward
+    agent_state
+        .complete_pairing_for_company(
+            "conn-profit-222",
+            "token-profit-secret-222",
+            "ProfitCorp",
+            Some("guid-profit-222"),
+        )
+        .await
+        .unwrap();
+
+    // 3. Both profiles must remain connected in profiles.json
+    let profiles = agent_state.profile_store.load_all().unwrap();
+    assert_eq!(profiles.len(), 2, "Both DemoCorp and ProfitCorp must be in profiles.json");
+    let prof_demo = profiles.iter().find(|p| p.connection_id == "conn-demo-111").expect("DemoCorp profile present");
+    let prof_profit = profiles.iter().find(|p| p.connection_id == "conn-profit-222").expect("ProfitCorp profile present");
+    assert_eq!(prof_demo.company_name, "DemoCorp");
+    assert_eq!(prof_profit.company_name, "ProfitCorp");
+
+    // 4. DemoCorp token in vault remains unchanged
+    assert_eq!(Vault::get_token_for("conn-demo-111").unwrap(), "token-demo-secret-111");
+
+    // 5. ProfitCorp gets separate token
+    assert_eq!(Vault::get_token_for("conn-profit-222").unwrap(), "token-profit-secret-222");
+
+    // 6. DemoCorp checkpoint remains unchanged at 207
+    let cp_demo_after = cp_store_demo.load().unwrap();
+    assert_eq!(cp_demo_after.last_known_alter_id, 207, "DemoCorp checkpoint must remain 207");
+    assert!(cp_demo_after.backfill_complete, "DemoCorp backfill state must remain true");
+
+    // 7. ProfitCorp has independent checkpoint (0)
+    let cp_store_profit = CheckpointStore::for_connection_in_dir(dir.path(), "conn-profit-222");
+    let cp_profit = cp_store_profit.load().unwrap();
+    assert_eq!(cp_profit.last_known_alter_id, 0, "ProfitCorp checkpoint must be 0");
+    assert!(!cp_profit.backfill_complete, "ProfitCorp backfill must be false");
+
+    // 8. Connecting third company (ThunderClaps) does not disconnect first two
+    agent_state
+        .complete_pairing_for_company(
+            "conn-thunder-333",
+            "token-thunder-secret-333",
+            "ThunderClaps",
+            Some("guid-thunder-333"),
+        )
+        .await
+        .unwrap();
+
+    let profiles_3 = agent_state.profile_store.load_all().unwrap();
+    assert_eq!(profiles_3.len(), 3, "All 3 companies must be present");
+    assert_eq!(Vault::get_token_for("conn-demo-111").unwrap(), "token-demo-secret-111");
+    assert_eq!(Vault::get_token_for("conn-profit-222").unwrap(), "token-profit-secret-222");
+    assert_eq!(Vault::get_token_for("conn-thunder-333").unwrap(), "token-thunder-secret-333");
+    assert_eq!(cp_store_demo.load().unwrap().last_known_alter_id, 207);
+
+    // 9. Restart restores all companies
+    let restarted_agent = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        profiles_file.clone(),
+    )
+    .unwrap();
+
+    let loaded_profiles = restarted_agent.profile_store.load_all().unwrap();
+    assert_eq!(loaded_profiles.len(), 3);
+    assert_eq!(Vault::get_token_for("conn-demo-111").unwrap(), "token-demo-secret-111");
+    assert_eq!(Vault::get_token_for("conn-profit-222").unwrap(), "token-profit-secret-222");
+    assert_eq!(Vault::get_token_for("conn-thunder-333").unwrap(), "token-thunder-secret-333");
+
+    // 10. Re-pairing DemoCorp preserves existing checkpoint (207)
+    restarted_agent
+        .complete_pairing_for_company(
+            "conn-demo-reconnected-444",
+            "token-demo-new-444",
+            "DemoCorp",
+            Some("guid-demo-111"),
+        )
+        .await
+        .unwrap();
+
+    let cp_reconnected = CheckpointStore::for_connection_in_dir(dir.path(), "conn-demo-reconnected-444").load().unwrap();
+    assert_eq!(cp_reconnected.last_known_alter_id, 207, "Existing checkpoint (207) must be preserved on re-pairing DemoCorp");
+    assert!(cp_reconnected.backfill_complete, "Backfill state preserved on re-pairing");
+
+    // Cleanup vault entries
+    let _ = Vault::delete_token_for("conn-demo-111");
+    let _ = Vault::delete_token_for("conn-profit-222");
+    let _ = Vault::delete_token_for("conn-thunder-333");
+    let _ = Vault::delete_token_for("conn-demo-reconnected-444");
+}
+
+#[tokio::test]
+async fn test_tally_offline_preserves_connected_state_and_recovers_cleanly() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profiles_file = dir.path().join("profiles.json");
+
+    // Tally server that is initially offline (using unused port)
+    let offline_port = 59990;
+
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        offline_port,
+        None,
+        profiles_file,
+    )
+    .unwrap();
+
+    // Setup connected profiles
+    agent_state
+        .profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-demo-111".into(),
+            company_guid: Some("guid-demo-111".into()),
+            company_name: "DemoCorp".into(),
+            paired_at: "2026-09-09T08:00:00Z".into(),
+        })
+        .unwrap();
+
+    agent_state
+        .profile_store
+        .save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+            connection_id: "conn-profit-222".into(),
+            company_guid: Some("guid-profit-222".into()),
+            company_name: "ProfitCorp".into(),
+            paired_at: "2026-09-09T09:00:00Z".into(),
+        })
+        .unwrap();
+
+    // When Tally is offline, discover_and_merge_companies should return all connected companies with "Offline" status
+    // and NOT erase or hide them.
+    let _items_offline = agent_state.discover_and_merge_companies().await;
+    // Note: ping fails so discover returns error or offline items
+    let cached_offline = agent_state.get_companies_cached().await;
+    assert_eq!(cached_offline.len(), 2, "Both connected companies must remain present in cache when offline");
+    assert_eq!(cached_offline[0].status, "Offline");
+    assert_eq!(cached_offline[1].status, "Offline");
+    assert_eq!(cached_offline[0].is_connected, true);
+    assert_eq!(cached_offline[1].is_connected, true);
+}
+
+#[test]
+fn test_index_html_removes_empty_state_and_check_tally_now() {
+    let index_html_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("index.html");
+
+    let contents = std::fs::read_to_string(&index_html_path).expect("index.html must exist");
+
+    assert!(
+        !contents.contains("No Tally Companies Detected"),
+        "index.html must NOT contain 'No Tally Companies Detected'"
+    );
+    assert!(
+        !contents.contains("Check Tally Now"),
+        "index.html must NOT contain 'Check Tally Now'"
+    );
+    assert!(
+        !contents.contains("empty-refresh-btn"),
+        "index.html must NOT contain 'empty-refresh-btn'"
+    );
+    assert!(
+        contents.contains("id=\"toast\""),
+        "index.html must contain toast element"
+    );
+}
+
+#[tokio::test]
+async fn test_discovery_reconciliation_lifecycle() {
+    use fininsight_tally_agent_lib::tally_schema::DiscoveredCompany;
+    use fininsight_tally_agent_lib::checkpoint::ConnectionProfile;
+
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profiles_file = dir.path().join("profiles.json");
+
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        9000,
+        None,
+        profiles_file,
+    )
+    .unwrap();
+
+    // 1. Initial State: DemoCorp is connected with alter_id 207 and token
+    agent_state.profile_store.save(&ConnectionProfile {
+        connection_id: "conn-demo".into(),
+        company_guid: Some("guid-demo".into()),
+        company_name: "DemoCorp".into(),
+        paired_at: "2026-09-09T10:00:00Z".into(),
+    }).unwrap();
+    Vault::store_token_for("conn-demo", "token-demo-xyz").unwrap();
+    let cp_demo = agent_state.checkpoint_store_for_connection("conn-demo");
+    cp_demo.save(&fininsight_tally_agent_lib::checkpoint::Checkpoint {
+        connection_id: Some("conn-demo".into()),
+        last_known_alter_id: 207,
+        last_successful_sync: Some("2026-09-09T10:00:00Z".into()),
+        backfill_complete: true,
+    }).unwrap();
+
+    // WireSnaks is ALSO connected with alter_id 150 and token
+    agent_state.profile_store.save(&ConnectionProfile {
+        connection_id: "conn-wire".into(),
+        company_guid: Some("guid-wire".into()),
+        company_name: "WireSnaks".into(),
+        paired_at: "2026-09-09T11:00:00Z".into(),
+    }).unwrap();
+    Vault::store_token_for("conn-wire", "token-wire-abc").unwrap();
+    let cp_wire = agent_state.checkpoint_store_for_connection("conn-wire");
+    cp_wire.save(&fininsight_tally_agent_lib::checkpoint::Checkpoint {
+        connection_id: Some("conn-wire".into()),
+        last_known_alter_id: 150,
+        last_successful_sync: Some("2026-09-09T11:00:00Z".into()),
+        backfill_complete: true,
+    }).unwrap();
+
+    // --- DISCOVERY A: DemoCorp (active), ProfitCorp (unconnected), WireSnaks, UnconnectedExtra ---
+    let disc_a = vec![
+        DiscoveredCompany { company_name: "DemoCorp".into(), company_guid: Some("guid-demo".into()), alter_id: 207 },
+        DiscoveredCompany { company_name: "ProfitCorp".into(), company_guid: Some("guid-profit".into()), alter_id: 50 },
+        DiscoveredCompany { company_name: "WireSnaks".into(), company_guid: Some("guid-wire".into()), alter_id: 150 },
+        DiscoveredCompany { company_name: "UnconnectedExtra".into(), company_guid: Some("guid-extra".into()), alter_id: 10 },
+    ];
+    let active_a = fininsight_tally_agent_lib::tally_schema::CompanyInfo {
+        company_name: "DemoCorp".into(),
+        company_guid: Some("guid-demo".into()),
+        alter_id: 207,
+    };
+
+    let items_a = agent_state.reconcile_company_items(&disc_a, Some(&active_a), true).await;
+    assert_eq!(items_a.len(), 4, "DemoCorp, WireSnaks, ProfitCorp, UnconnectedExtra");
+    
+    let demo_a = items_a.iter().find(|i| i.company_name == "DemoCorp").unwrap();
+    assert_eq!(demo_a.status, "Connected · Active");
+    assert!(demo_a.is_connected);
+    assert!(demo_a.is_active_in_tally);
+
+    let wire_a = items_a.iter().find(|i| i.company_name == "WireSnaks").unwrap();
+    assert_eq!(wire_a.status, "Connected · Inactive");
+    assert!(wire_a.is_connected);
+    assert!(!wire_a.is_active_in_tally);
+
+    let profit_a = items_a.iter().find(|i| i.company_name == "ProfitCorp").unwrap();
+    assert_eq!(profit_a.status, "Available · Inactive");
+    assert!(!profit_a.is_connected);
+
+    let extra_a = items_a.iter().find(|i| i.company_name == "UnconnectedExtra").unwrap();
+    assert_eq!(extra_a.status, "Available · Inactive");
+    assert!(!extra_a.is_connected);
+
+    // --- DISCOVERY B: Tally only returns DemoCorp and ProfitCorp (ProfitCorp now active) ---
+    // WireSnaks & UnconnectedExtra closed/removed in Tally
+    let disc_b = vec![
+        DiscoveredCompany { company_name: "DemoCorp".into(), company_guid: Some("guid-demo".into()), alter_id: 207 },
+        DiscoveredCompany { company_name: "ProfitCorp".into(), company_guid: Some("guid-profit".into()), alter_id: 50 },
+    ];
+    let active_b = fininsight_tally_agent_lib::tally_schema::CompanyInfo {
+        company_name: "ProfitCorp".into(),
+        company_guid: Some("guid-profit".into()),
+        alter_id: 50,
+    };
+
+    let items_b = agent_state.reconcile_company_items(&disc_b, Some(&active_b), true).await;
+
+    // 1. UnconnectedExtra MUST completely disappear
+    assert!(items_b.iter().all(|i| i.company_name != "UnconnectedExtra"), "UnconnectedExtra must disappear after removal from Tally");
+
+    // 2. DemoCorp is connected but inactive
+    let demo_b = items_b.iter().find(|i| i.company_name == "DemoCorp").unwrap();
+    assert_eq!(demo_b.status, "Connected · Inactive");
+    assert!(demo_b.is_connected);
+    assert!(!demo_b.is_active_in_tally);
+    assert_eq!(demo_b.alter_id, 207);
+
+    // 3. ProfitCorp is available and active
+    let profit_b = items_b.iter().find(|i| i.company_name == "ProfitCorp").unwrap();
+    assert_eq!(profit_b.status, "Available · Active");
+    assert!(!profit_b.is_connected);
+    assert!(profit_b.is_active_in_tally);
+
+    // 4. WireSnaks was connected, so it MUST remain visible with "Connected · Not currently available"
+    let wire_b = items_b.iter().find(|i| i.company_name == "WireSnaks").unwrap();
+    assert_eq!(wire_b.status, "Connected · Not currently available");
+    assert!(wire_b.is_connected);
+    assert!(!wire_b.is_active_in_tally);
+    assert_eq!(wire_b.alter_id, 150);
+
+    // 5. Verify WireSnaks persistent profile, token, checkpoint are 100% UNTOUCHED
+    assert_eq!(agent_state.profile_store.get_by_connection_id("conn-wire").unwrap().unwrap().company_name, "WireSnaks");
+    assert_eq!(Vault::get_token_for("conn-wire").unwrap(), "token-wire-abc");
+    assert_eq!(cp_wire.load().unwrap().last_known_alter_id, 150);
+
+    // 6. Connect ProfitCorp
+    agent_state.profile_store.save(&ConnectionProfile {
+        connection_id: "conn-profit".into(),
+        company_guid: Some("guid-profit".into()),
+        company_name: "ProfitCorp".into(),
+        paired_at: "2026-09-09T12:00:00Z".into(),
+    }).unwrap();
+    Vault::store_token_for("conn-profit", "token-profit-999").unwrap();
+    let cp_profit = agent_state.checkpoint_store_for_connection("conn-profit");
+    cp_profit.save(&fininsight_tally_agent_lib::checkpoint::Checkpoint {
+        connection_id: Some("conn-profit".into()),
+        last_known_alter_id: 50,
+        last_successful_sync: None,
+        backfill_complete: false,
+    }).unwrap();
+
+    // --- DISCOVERY C: WireSnaks re-opened in Tally ---
+    let disc_c = vec![
+        DiscoveredCompany { company_name: "DemoCorp".into(), company_guid: Some("guid-demo".into()), alter_id: 207 },
+        DiscoveredCompany { company_name: "ProfitCorp".into(), company_guid: Some("guid-profit".into()), alter_id: 50 },
+        DiscoveredCompany { company_name: "WireSnaks".into(), company_guid: Some("guid-wire".into()), alter_id: 150 },
+    ];
+    let items_c = agent_state.reconcile_company_items(&disc_c, Some(&active_b), true).await;
+    assert_eq!(items_c.len(), 3);
+
+    let wire_c = items_c.iter().find(|i| i.company_name == "WireSnaks").unwrap();
+    assert_eq!(wire_c.status, "Connected · Inactive", "WireSnaks automatically becomes Connected Inactive without re-pairing");
+    assert_eq!(wire_c.alter_id, 150);
+
+    let profit_c = items_c.iter().find(|i| i.company_name == "ProfitCorp").unwrap();
+    assert_eq!(profit_c.status, "Connected · Active");
+    assert_eq!(profit_c.alter_id, 50);
+
+    // --- DISCOVERY D: Tally is Offline ---
+    let items_offline = agent_state.reconcile_company_items(&[], None, false).await;
+    assert_eq!(items_offline.len(), 3, "All 3 connected companies must be visible when Tally is offline");
+    for item in &items_offline {
+        assert_eq!(item.status, "Offline");
+        assert!(item.is_connected);
+        assert!(!item.is_active_in_tally);
+    }
+
+    // Cleanup vault tokens
+    let _ = Vault::delete_token_for("conn-demo");
+    let _ = Vault::delete_token_for("conn-wire");
+    let _ = Vault::delete_token_for("conn-profit");
+}
+
+
 

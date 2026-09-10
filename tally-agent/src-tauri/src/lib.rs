@@ -84,6 +84,22 @@ pub struct AgentState {
     pub syncing_connections: RwLock<HashMap<String, bool>>,
 }
 
+pub fn matches_company(
+    guid_a: Option<&str>,
+    name_a: &str,
+    guid_b: Option<&str>,
+    name_b: &str,
+) -> bool {
+    if let (Some(ga), Some(gb)) = (guid_a, guid_b) {
+        let ga_clean = ga.trim();
+        let gb_clean = gb.trim();
+        if !ga_clean.is_empty() && !gb_clean.is_empty() {
+            return ga_clean.eq_ignore_ascii_case(gb_clean);
+        }
+    }
+    name_a.trim().eq_ignore_ascii_case(name_b.trim())
+}
+
 impl AgentState {
     pub fn new(tally_port: u16) -> Result<Self, AgentError> {
         Self::with_options(tally_port, None, CheckpointStore::default_path())
@@ -171,6 +187,11 @@ impl AgentState {
         })
     }
 
+    pub fn checkpoint_store_for_connection(&self, connection_id: &str) -> CheckpointStore {
+        let base_dir = self.profile_store.path().parent().unwrap_or_else(|| std::path::Path::new("."));
+        CheckpointStore::for_connection_in_dir(base_dir, connection_id)
+    }
+
     pub fn new_tally_client(&self) -> Result<TallyClient, AgentError> {
         let endpoint = TallyEndpoint::new("127.0.0.1", self.tally_port)?;
         Ok(TallyClient::new(endpoint)?)
@@ -191,67 +212,55 @@ impl AgentState {
         }
     }
 
-    /// Discovers companies from Tally and merges with saved connection profiles.
-    pub async fn discover_and_merge_companies(&self) -> Result<Vec<CompanyItem>, AgentError> {
-        let tally_client = match self.new_tally_client() {
-            Ok(c) => c,
-            Err(e) => return Err(e),
-        };
-
-        // Query active company and discovery list
-        let active_res = tally_client.ping().await;
-        let discovery_res = tally_client.discover_companies().await;
-
-        let is_tally_reachable = active_res.is_ok();
-        let active_company = active_res.ok();
-        let discovered_raw = discovery_res.unwrap_or_default();
-
-        // Update runtime caches
-        {
-            let mut active_cache = self.active_tally_company.write().await;
-            *active_cache = active_company.clone();
-        }
-        {
-            let mut disc_cache = self.discovered_companies.write().await;
-            *disc_cache = discovered_raw.clone();
-        }
-
+    /// Reconciles the latest Tally discovery with persistent connected profiles.
+    pub async fn reconcile_company_items(
+        &self,
+        discovered_raw: &[DiscoveredCompany],
+        active_company: Option<&CompanyInfo>,
+        is_tally_reachable: bool,
+    ) -> Vec<CompanyItem> {
         let profiles = self.profile_store.load_all().unwrap_or_default();
         let errors = self.per_company_errors.read().await.clone();
         let syncing_map = self.syncing_connections.read().await.clone();
 
         let mut items: Vec<CompanyItem> = Vec::new();
-        let mut processed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut processed_companies: Vec<(Option<String>, String)> = Vec::new();
 
-        // 1. Process all saved connected profiles
+        // 1. Process all persistent connected profiles
         for profile in &profiles {
             let cid = &profile.connection_id;
-            let cp_store = CheckpointStore::for_connection(cid);
+            let cp_store = self.checkpoint_store_for_connection(cid);
             let checkpoint = cp_store.load().unwrap_or_default();
 
             // Match against active Tally company
-            let is_active = if let Some(ref active) = active_company {
-                if let Some(ref p_guid) = profile.company_guid {
-                    if let Some(ref a_guid) = active.company_guid {
-                        p_guid.eq_ignore_ascii_case(a_guid)
-                    } else {
-                        profile.company_name.eq_ignore_ascii_case(&active.company_name)
-                    }
+            let is_active = if is_tally_reachable {
+                if let Some(active) = active_company {
+                    matches_company(
+                        profile.company_guid.as_deref(),
+                        &profile.company_name,
+                        active.company_guid.as_deref(),
+                        &active.company_name,
+                    )
                 } else {
-                    profile.company_name.eq_ignore_ascii_case(&active.company_name)
+                    false
                 }
             } else {
                 false
             };
 
-            // Check if present in discovery list
-            let in_discovery = discovered_raw.iter().any(|d| {
-                if let (Some(ref pg), Some(ref dg)) = (&profile.company_guid, &d.company_guid) {
-                    pg.eq_ignore_ascii_case(dg)
-                } else {
-                    profile.company_name.eq_ignore_ascii_case(&d.company_name)
-                }
-            });
+            // Check if present in latest discovery list
+            let in_discovery = if is_tally_reachable {
+                discovered_raw.iter().any(|d| {
+                    matches_company(
+                        profile.company_guid.as_deref(),
+                        &profile.company_name,
+                        d.company_guid.as_deref(),
+                        &d.company_name,
+                    )
+                })
+            } else {
+                false
+            };
 
             let is_syncing = syncing_map.get(cid).copied().unwrap_or(false);
             let err = errors.get(cid).cloned();
@@ -265,9 +274,9 @@ impl AgentState {
             } else if is_active {
                 "Connected · Active".to_string()
             } else if in_discovery {
-                "Connected · Inactive in Tally".to_string()
+                "Connected · Inactive".to_string()
             } else {
-                "Offline / Not Open".to_string()
+                "Connected · Not currently available".to_string()
             };
 
             items.push(CompanyItem {
@@ -285,48 +294,109 @@ impl AgentState {
                 backfill_complete: checkpoint.backfill_complete,
             });
 
-            processed_names.insert(profile.company_name.to_ascii_lowercase());
+            processed_companies.push((profile.company_guid.clone(), profile.company_name.clone()));
         }
 
         // 2. Process discovered companies that are NOT yet connected
-        for disc in &discovered_raw {
-            if processed_names.contains(&disc.company_name.to_ascii_lowercase()) {
-                continue;
-            }
+        if is_tally_reachable {
+            for disc in discovered_raw {
+                let already_processed = processed_companies.iter().any(|(g, n)| {
+                    matches_company(
+                        disc.company_guid.as_deref(),
+                        &disc.company_name,
+                        g.as_deref(),
+                        n,
+                    )
+                });
 
-            let is_active = if let Some(ref active) = active_company {
-                if let (Some(ref dg), Some(ref ag)) = (&disc.company_guid, &active.company_guid) {
-                    dg.eq_ignore_ascii_case(ag)
-                } else {
-                    disc.company_name.eq_ignore_ascii_case(&active.company_name)
+                if already_processed {
+                    continue;
                 }
-            } else {
-                false
-            };
 
-            let status = if is_active {
-                "Available · Active".to_string()
-            } else {
-                "Available · Not Active".to_string()
-            };
+                let is_active = if let Some(active) = active_company {
+                    matches_company(
+                        disc.company_guid.as_deref(),
+                        &disc.company_name,
+                        active.company_guid.as_deref(),
+                        &active.company_name,
+                    )
+                } else {
+                    false
+                };
 
-            items.push(CompanyItem {
-                company_name: disc.company_name.clone(),
-                company_guid: disc.company_guid.clone(),
-                alter_id: disc.alter_id,
-                is_active_in_tally: is_active,
-                is_connected: false,
-                connection_id: None,
-                status,
-                last_successful_sync: None,
-                last_known_alter_id: 0,
-                last_error: None,
-                sync_in_progress: false,
-                backfill_complete: false,
-            });
+                let status = if is_active {
+                    "Available · Active".to_string()
+                } else {
+                    "Available · Inactive".to_string()
+                };
+
+                items.push(CompanyItem {
+                    company_name: disc.company_name.clone(),
+                    company_guid: disc.company_guid.clone(),
+                    alter_id: disc.alter_id,
+                    is_active_in_tally: is_active,
+                    is_connected: false,
+                    connection_id: None,
+                    status,
+                    last_successful_sync: None,
+                    last_known_alter_id: 0,
+                    last_error: None,
+                    sync_in_progress: false,
+                    backfill_complete: false,
+                });
+            }
         }
 
+        items
+    }
+
+    /// Discovers companies from Tally and reconciles with saved connection profiles.
+    pub async fn discover_and_merge_companies(&self) -> Result<Vec<CompanyItem>, AgentError> {
+        let tally_client = match self.new_tally_client() {
+            Ok(c) => c,
+            Err(e) => return Err(e),
+        };
+
+        // Query active company and discovery list
+        let active_res = tally_client.ping().await;
+        let discovery_res = tally_client.discover_companies().await;
+
+        let is_tally_reachable = active_res.is_ok() || discovery_res.is_ok();
+        let active_company = active_res.ok();
+        let mut discovered_raw = discovery_res.unwrap_or_default();
+
+        if is_tally_reachable && discovered_raw.is_empty() {
+            if let Some(ref active) = active_company {
+                discovered_raw.push(DiscoveredCompany {
+                    company_name: active.company_name.clone(),
+                    company_guid: active.company_guid.clone(),
+                    alter_id: active.alter_id,
+                });
+            }
+        }
+
+        // Update runtime caches with authoritative latest Tally discovery
+        {
+            let mut active_cache = self.active_tally_company.write().await;
+            *active_cache = active_company.clone();
+        }
+        {
+            let mut disc_cache = self.discovered_companies.write().await;
+            *disc_cache = if is_tally_reachable {
+                discovered_raw.clone()
+            } else {
+                Vec::new()
+            };
+        }
+
+        let items = self.reconcile_company_items(
+            &discovered_raw,
+            active_company.as_ref(),
+            is_tally_reachable,
+        ).await;
+
         // Update overall AgentStatus
+        let profiles = self.profile_store.load_all().unwrap_or_default();
         let any_paired = !profiles.is_empty();
         let mut status = self.status.write().await;
         status.paired = any_paired;
@@ -345,112 +415,15 @@ impl AgentState {
 
     /// Returns cached company list without hitting Tally (for frequent UI polling).
     pub async fn get_companies_cached(&self) -> Vec<CompanyItem> {
-        let profiles = self.profile_store.load_all().unwrap_or_default();
-        let discovered_raw = self.discovered_companies.read().await.clone();
         let active_company = self.active_tally_company.read().await.clone();
-        let errors = self.per_company_errors.read().await.clone();
-        let syncing_map = self.syncing_connections.read().await.clone();
-        let is_tally_reachable = active_company.is_some();
+        let discovered_raw = self.discovered_companies.read().await.clone();
+        let is_tally_reachable = active_company.is_some() || !discovered_raw.is_empty();
 
-        let mut items: Vec<CompanyItem> = Vec::new();
-        let mut processed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for profile in &profiles {
-            let cid = &profile.connection_id;
-            let cp_store = CheckpointStore::for_connection(cid);
-            let checkpoint = cp_store.load().unwrap_or_default();
-
-            let is_active = if let Some(ref active) = active_company {
-                if let (Some(ref pg), Some(ref ag)) = (&profile.company_guid, &active.company_guid) {
-                    pg.eq_ignore_ascii_case(ag)
-                } else {
-                    profile.company_name.eq_ignore_ascii_case(&active.company_name)
-                }
-            } else {
-                false
-            };
-
-            let in_discovery = discovered_raw.iter().any(|d| {
-                if let (Some(ref pg), Some(ref dg)) = (&profile.company_guid, &d.company_guid) {
-                    pg.eq_ignore_ascii_case(dg)
-                } else {
-                    profile.company_name.eq_ignore_ascii_case(&d.company_name)
-                }
-            });
-
-            let is_syncing = syncing_map.get(cid).copied().unwrap_or(false);
-            let err = errors.get(cid).cloned();
-
-            let status = if !is_tally_reachable {
-                "Offline".to_string()
-            } else if is_syncing {
-                "Syncing…".to_string()
-            } else if let Some(ref e) = err {
-                format!("Error: {}", e)
-            } else if is_active {
-                "Connected · Active".to_string()
-            } else if in_discovery {
-                "Connected · Inactive in Tally".to_string()
-            } else {
-                "Offline / Not Open".to_string()
-            };
-
-            items.push(CompanyItem {
-                company_name: profile.company_name.clone(),
-                company_guid: profile.company_guid.clone(),
-                alter_id: checkpoint.last_known_alter_id,
-                is_active_in_tally: is_active,
-                is_connected: true,
-                connection_id: Some(cid.clone()),
-                status,
-                last_successful_sync: checkpoint.last_successful_sync,
-                last_known_alter_id: checkpoint.last_known_alter_id,
-                last_error: err,
-                sync_in_progress: is_syncing,
-                backfill_complete: checkpoint.backfill_complete,
-            });
-
-            processed_names.insert(profile.company_name.to_ascii_lowercase());
-        }
-
-        for disc in &discovered_raw {
-            if processed_names.contains(&disc.company_name.to_ascii_lowercase()) {
-                continue;
-            }
-
-            let is_active = if let Some(ref active) = active_company {
-                if let (Some(ref dg), Some(ref ag)) = (&disc.company_guid, &active.company_guid) {
-                    dg.eq_ignore_ascii_case(ag)
-                } else {
-                    disc.company_name.eq_ignore_ascii_case(&active.company_name)
-                }
-            } else {
-                false
-            };
-
-            let status = if is_active {
-                "Available · Active".to_string()
-            } else {
-                "Available · Not Active".to_string()
-            };
-
-            items.push(CompanyItem {
-                company_name: disc.company_name.clone(),
-                company_guid: disc.company_guid.clone(),
-                alter_id: disc.alter_id,
-                is_active_in_tally: is_active,
-                is_connected: false,
-                connection_id: None,
-                status,
-                last_successful_sync: None,
-                last_known_alter_id: 0,
-                last_error: None,
-                sync_in_progress: false,
-                backfill_complete: false,
-            });
-        }
-
-        items
+        self.reconcile_company_items(
+            &discovered_raw,
+            active_company.as_ref(),
+            is_tally_reachable,
+        ).await
     }
 
     /// Refresh status on demand.
@@ -463,14 +436,36 @@ impl AgentState {
     pub async fn start_company_device_login(
         &self,
         company_name: &str,
-        _company_guid: Option<&str>,
+        company_guid: Option<&str>,
     ) -> Result<DeviceAuthPublicSession, AgentError> {
         // Verify that Tally is reachable
         let tally = self.new_tally_client()?;
         let _ = tally.ping().await?;
 
         let cloud = self.new_cloud_client()?;
-        let session = crate::device_auth::initiate_device_auth(&cloud, company_name).await?;
+        // Check if THIS specific company already has a connection profile
+        let previous_connection_id = self
+            .profile_store
+            .get_by_guid_or_name(company_guid, company_name)
+            .ok()
+            .flatten()
+            .map(|p| p.connection_id)
+            .or_else(|| {
+                // Fallback to Vault only if there are no existing profiles stored,
+                // preventing cross-company connection_id collision.
+                if self.profile_store.load_all().map(|p| p.is_empty()).unwrap_or(true) {
+                    Vault::get_connection_id().ok()
+                } else {
+                    None
+                }
+            });
+
+        let session = crate::device_auth::initiate_device_auth_with_prev_cid(
+            &cloud,
+            company_name,
+            previous_connection_id,
+        )
+        .await?;
 
         log::info!("[device_login] Opening browser to {}", &session.verification_uri);
         let browser_opened = opener::open(&session.verification_uri).is_ok();
@@ -545,6 +540,13 @@ impl AgentState {
         company_name: &str,
         company_guid: Option<&str>,
     ) -> Result<String, AgentError> {
+        // Check if this company already had a previous profile
+        let existing_profile = self
+            .profile_store
+            .get_by_guid_or_name(company_guid, company_name)
+            .ok()
+            .flatten();
+
         let profile = ConnectionProfile {
             connection_id: connection_id.to_string(),
             company_guid: company_guid.map(String::from),
@@ -561,13 +563,36 @@ impl AgentState {
         }
         let _ = Vault::store_connection_id(connection_id);
 
-        let conn_checkpoint_store = CheckpointStore::for_connection(connection_id);
-        let _ = conn_checkpoint_store.save(&Checkpoint {
-            connection_id: Some(connection_id.to_string()),
-            last_known_alter_id: 0,
-            last_successful_sync: None,
-            backfill_complete: false,
-        });
+        let conn_checkpoint_store = self.checkpoint_store_for_connection(connection_id);
+        if !conn_checkpoint_store.path().exists() {
+            // Check if we can preserve existing checkpoint from a previous connection for this company
+            let mut cp_to_save = Checkpoint {
+                connection_id: Some(connection_id.to_string()),
+                last_known_alter_id: 0,
+                last_successful_sync: None,
+                backfill_complete: false,
+            };
+
+            if let Some(old_prof) = existing_profile {
+                if old_prof.connection_id != connection_id {
+                    let old_cp_store = self.checkpoint_store_for_connection(&old_prof.connection_id);
+                    if let Ok(old_cp) = old_cp_store.load() {
+                        if old_cp.last_known_alter_id > 0 || old_cp.backfill_complete {
+                            log::info!(
+                                "[pair] Preserving existing checkpoint (alter_id: {}) from previous connection {} for '{}'",
+                                old_cp.last_known_alter_id,
+                                old_prof.connection_id,
+                                company_name
+                            );
+                            cp_to_save = old_cp;
+                            cp_to_save.connection_id = Some(connection_id.to_string());
+                        }
+                    }
+                }
+            }
+
+            let _ = conn_checkpoint_store.save(&cp_to_save);
+        }
 
         // NOTE: We do NOT extract accounting data during pairing.
         // Data extraction only runs when user clicks Sync Now or during scheduled extraction,
@@ -635,7 +660,7 @@ impl AgentState {
 
         let tally = self.new_tally_client()?;
         let cloud = self.new_cloud_client()?.with_token(&token);
-        let conn_checkpoint_store = CheckpointStore::for_connection(connection_id);
+        let conn_checkpoint_store = self.checkpoint_store_for_connection(connection_id);
 
         let orch = SyncOrchestrator::new(tally, cloud, conn_checkpoint_store.clone())
             .with_expected_profile(
@@ -729,12 +754,16 @@ impl AgentState {
     pub async fn handle_token_revoked_for_connection(&self, connection_id: &str) {
         log::warn!("Agent token revoked for connection {connection_id}. Clearing local credentials.");
         let _ = Vault::delete_token_for(connection_id);
-        let _ = Vault::delete_token();
         let _ = self.profile_store.delete_for_connection(connection_id);
+        let remaining_profiles = self.profile_store.load_all().unwrap_or_default();
         let mut status = self.status.write().await;
-        status.paired = false;
-        status.company_name = None;
-        status.last_error = Some("Agent token was revoked or expired. Please re-pair your connection.".into());
+        status.paired = !remaining_profiles.is_empty();
+        if remaining_profiles.is_empty() {
+            status.company_name = None;
+            status.last_error = Some("Agent token was revoked or expired. Please re-pair your connection.".into());
+            let _ = Vault::delete_token();
+            let _ = Vault::delete_connection_id();
+        }
     }
 
     pub async fn sync_now(&self) -> Result<SyncResult, AgentError> {
@@ -795,49 +824,54 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
                         continue;
                     }
 
-                    // Send heartbeat only for the currently active company in Tally (if connected)
-                    if let Some(ref active) = active_tally {
-                        if let Some(profile) = profiles.iter().find(|p| {
-                            if let (Some(ref pg), Some(ref ag)) = (&p.company_guid, &active.company_guid) {
+                    for profile in &profiles {
+                        let cid = &profile.connection_id;
+                        let token = match Vault::get_token_for(cid).or_else(|_| Vault::get_token()) {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+
+                        let is_active = if let Some(ref active) = active_tally {
+                            if let (Some(ref pg), Some(ref ag)) = (&profile.company_guid, &active.company_guid) {
                                 pg.eq_ignore_ascii_case(ag)
                             } else {
-                                p.company_name.eq_ignore_ascii_case(&active.company_name)
+                                profile.company_name.eq_ignore_ascii_case(&active.company_name)
                             }
-                        }) {
-                            let cid = &profile.connection_id;
-                            let token = match Vault::get_token_for(cid).or_else(|_| Vault::get_token()) {
-                                Ok(t) => t,
-                                Err(_) => continue,
-                            };
+                        } else {
+                            false
+                        };
 
-                            let cp_store = CheckpointStore::for_connection(cid);
-                            let checkpoint = cp_store.load().unwrap_or_default();
+                        let cp_store = state.checkpoint_store_for_connection(cid);
+                        let checkpoint = cp_store.load().unwrap_or_default();
 
-                            let cloud = match state.new_cloud_client() {
-                                Ok(c) => c.with_token(&token),
-                                Err(_) => continue,
-                            };
+                        let cloud = match state.new_cloud_client() {
+                            Ok(c) => c.with_token(&token),
+                            Err(_) => continue,
+                        };
 
-                            let payload = HeartbeatPayload {
-                                tally_reachable,
-                                agent_version: AGENT_VERSION.to_string(),
-                                last_known_alter_id: checkpoint.last_known_alter_id,
-                            };
+                        let payload = HeartbeatPayload {
+                            tally_reachable: tally_reachable && is_active,
+                            agent_version: AGENT_VERSION.to_string(),
+                            last_known_alter_id: checkpoint.last_known_alter_id,
+                        };
 
-                            match cloud.heartbeat(&payload).await {
-                                Ok(resp) => {
-                                    if resp.is_sync_requested() {
+                        match cloud.heartbeat(&payload).await {
+                            Ok(resp) => {
+                                if resp.is_sync_requested() {
+                                    if is_active {
                                         log::info!("Dashboard requested sync via heartbeat for connection {}", cid);
                                         let _ = state.sync_company(cid).await;
+                                    } else {
+                                        log::info!("Dashboard requested sync for connection {}, but company '{}' is not currently active in Tally", cid, profile.company_name);
                                     }
                                 }
-                                Err(ApiError::TokenRevoked) => {
-                                    log::warn!("Token revoked for connection {}", cid);
-                                    let _ = state.disconnect_company(cid).await;
-                                }
-                                Err(e) => {
-                                    log::debug!("Heartbeat error: {:?}", e);
-                                }
+                            }
+                            Err(ApiError::TokenRevoked) => {
+                                log::warn!("Token revoked for connection {}", cid);
+                                let _ = state.disconnect_company(cid).await;
+                            }
+                            Err(e) => {
+                                log::debug!("Heartbeat error for connection {}: {:?}", cid, e);
                             }
                         }
                     }

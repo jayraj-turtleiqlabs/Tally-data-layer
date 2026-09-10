@@ -440,3 +440,30 @@ input[type="text"] {
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
 }
 
+/* Non-blocking Toast Notification */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1e293b;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+  padding: 8px 18px;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  z-index: 1000;
+  opacity: 1;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.toast.hidden {
+  opacity: 0;
+  transform: translate(-50%, 12px);
+  pointer-events: none;
+}
+

@@ -25,8 +25,8 @@ const tallyStatusBadge = document.getElementById("tally-status-badge")!;
 const refreshBtn = document.getElementById("refresh-btn") as HTMLButtonElement;
 const discoveringIndicator = document.getElementById("discovering-indicator")!;
 const companiesList = document.getElementById("companies-list")!;
-const emptyState = document.getElementById("empty-state")!;
-const emptyRefreshBtn = document.getElementById("empty-refresh-btn") as HTMLButtonElement;
+const toast = document.getElementById("toast")!;
+const toastMessage = document.getElementById("toast-message")!;
 
 // Auth modal elements
 const authModal = document.getElementById("auth-modal")!;
@@ -38,6 +38,26 @@ const browserAuthError = document.getElementById("browser-auth-error")!;
 const cancelBrowserBtn = document.getElementById("cancel-browser-btn") as HTMLButtonElement;
 
 let isPollingAuth = false;
+let toastTimeout: number | null = null;
+let lastTallyReachableState: boolean | null = null;
+let lastToastShownTime = 0;
+
+function showToast(message: string, durationMs = 3500) {
+  const now = Date.now();
+  // Prevent spamming within 8 seconds with the same message
+  if (now - lastToastShownTime < 8000 && toastMessage.textContent === message && !toast.classList.contains("hidden")) {
+    return;
+  }
+  lastToastShownTime = now;
+  toastMessage.textContent = message;
+  toast.classList.remove("hidden");
+  if (toastTimeout) {
+    clearTimeout(toastTimeout);
+  }
+  toastTimeout = window.setTimeout(() => {
+    toast.classList.add("hidden");
+  }, durationMs);
+}
 
 function formatDate(iso?: string | null): string {
   if (!iso) return "Never";
@@ -49,14 +69,22 @@ function formatDate(iso?: string | null): string {
 }
 
 function updateTallyBadge(companies: CompanyItem[]) {
-  const isReachable = companies.some((c) => c.status !== "Offline");
+  const isReachable = companies.some((c) => c.status !== "Offline" && !c.status.includes("Offline"));
   tallyStatusBadge.className = "badge";
   if (isReachable) {
     tallyStatusBadge.textContent = "● Tally Reachable";
     tallyStatusBadge.classList.add("badge-paired");
+    if (lastTallyReachableState === false) {
+      toast.classList.add("hidden");
+    }
+    lastTallyReachableState = true;
   } else {
     tallyStatusBadge.textContent = "○ Tally Offline";
     tallyStatusBadge.classList.add("badge-error");
+    if (lastTallyReachableState !== false) {
+      showToast("Tally is not running");
+    }
+    lastTallyReachableState = false;
   }
 }
 
@@ -65,13 +93,14 @@ function renderCompanies(companies: CompanyItem[]) {
   companiesList.innerHTML = "";
 
   if (companies.length === 0) {
-    companiesList.classList.add("hidden");
-    emptyState.classList.remove("hidden");
+    companiesList.innerHTML = `
+      <div class="empty-card">
+        <p class="empty-title">No Companies Found</p>
+        <p class="empty-hint">Open a company in Tally to connect.</p>
+      </div>
+    `;
     return;
   }
-
-  emptyState.classList.add("hidden");
-  companiesList.classList.remove("hidden");
 
   for (const company of companies) {
     const card = document.createElement("div");
@@ -81,6 +110,7 @@ function renderCompanies(companies: CompanyItem[]) {
       // Connected Card
       const isOnlineActive = company.is_active_in_tally && company.status.includes("Active");
       const isOffline = company.status === "Offline" || company.status.includes("Offline");
+      const isUnavailable = company.status.includes("Not currently available") || company.status.includes("Not Open");
       const isSyncing = company.sync_in_progress;
 
       let badgeClass = "badge-paired";
@@ -89,12 +119,22 @@ function renderCompanies(companies: CompanyItem[]) {
       if (isOffline) {
         badgeClass = "badge-error";
         statusLabel = "○ Offline";
+      } else if (isUnavailable) {
+        badgeClass = "badge-unpaired";
+        statusLabel = "○ Connected · Not currently available";
       } else if (isSyncing) {
         badgeClass = "badge-syncing";
         statusLabel = "⏳ Syncing…";
       } else if (!company.is_active_in_tally) {
         badgeClass = "badge-unpaired";
         statusLabel = "○ Connected · Inactive";
+      }
+
+      let hintText = "";
+      if (isUnavailable) {
+        hintText = `<p class="inactive-hint">Tally does not have this company loaded. Open ${escapeHtml(company.company_name)} in Tally to sync.</p>`;
+      } else if (!company.is_active_in_tally && !isOffline) {
+        hintText = `<p class="inactive-hint">Tally currently has another company open. Open ${escapeHtml(company.company_name)} in Tally to sync.</p>`;
       }
 
       card.innerHTML = `
@@ -106,7 +146,7 @@ function renderCompanies(companies: CompanyItem[]) {
           <span class="badge ${badgeClass}">${statusLabel}</span>
         </div>
 
-        ${!company.is_active_in_tally && !isOffline ? `<p class="inactive-hint">Tally currently has another company open. Open ${escapeHtml(company.company_name)} in Tally to sync.</p>` : ""}
+        ${hintText}
 
         <dl class="status-grid">
           <dt>Last sync</dt>
@@ -129,7 +169,7 @@ function renderCompanies(companies: CompanyItem[]) {
     } else {
       // Discovered / Unconnected Card
       const isOnlineActive = company.is_active_in_tally;
-      const statusLabel = isOnlineActive ? "● Found in Tally · Not connected" : "○ Found in Tally · Not connected";
+      const statusLabel = isOnlineActive ? "● Found in Tally · Active" : "○ Found in Tally · Inactive";
       const badgeClass = isOnlineActive ? "badge-paired" : "badge-idle";
 
       card.innerHTML = `
@@ -290,6 +330,7 @@ async function refreshCompaniesReal() {
     renderCompanies(companies);
   } catch (e) {
     console.error("Failed to refresh companies:", e);
+    showToast("Tally is not reachable");
   } finally {
     discoveringIndicator.classList.add("hidden");
     refreshBtn.disabled = false;
@@ -300,13 +341,12 @@ refreshBtn.addEventListener("click", () => {
   refreshCompaniesReal();
 });
 
-emptyRefreshBtn.addEventListener("click", () => {
-  refreshCompaniesReal();
-});
-
 // Initialize on app startup
 refreshCompaniesReal();
 
 // Fast local UI polling from in-memory cache without hammering Tally
 setInterval(loadCompaniesCached, 5000);
+
+// Background refresh of Tally discovery every 30s
+setInterval(refreshCompaniesReal, 30000);
 
