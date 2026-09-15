@@ -347,6 +347,6 @@ refreshCompaniesReal();
 // Fast local UI polling from in-memory cache without hammering Tally
 setInterval(loadCompaniesCached, 5000);
 
-// Background refresh of Tally discovery every 30s
-setInterval(refreshCompaniesReal, 30000);
+// Background refresh of Tally discovery every 45s
+setInterval(refreshCompaniesReal, 45000);
 
