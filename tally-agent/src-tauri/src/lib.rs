@@ -560,6 +560,15 @@ impl AgentState {
         if !token.is_empty() {
             log::info!("[pair] Storing agent token in vault for connection {}...", connection_id);
             Vault::store_token_for(connection_id, token)?;
+        } else if let Some(ref old_prof) = existing_profile {
+            if let Ok(old_tok) = Vault::get_token_for(&old_prof.connection_id) {
+                log::info!(
+                    "[pair] Preserving existing vault token from connection {} for connection {}...",
+                    old_prof.connection_id,
+                    connection_id
+                );
+                let _ = Vault::store_token_for(connection_id, &old_tok);
+            }
         }
         let _ = Vault::store_connection_id(connection_id);
 

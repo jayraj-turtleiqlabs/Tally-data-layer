@@ -321,6 +321,250 @@ async fn test_device_auth_expired_stops_polling() {
 }
 
 #[tokio::test]
+async fn test_device_auth_pending_then_approved_e2e_flow() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::delete_token();
+    let _ = Vault::delete_connection_id();
+
+    // 1. Mock Tally
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Alpha Dynamics</NAME><ALTERID>100</ALTERID><GUID>guid-alpha-100</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    // 2. Mock Cloud Backend: Initiate
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/initiate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-alpha-code",
+            "user_code": "ALPH-1234",
+            "verification_uri": "https://app.fininsight.io/device?user_code=ALPH-1234",
+            "expires_in": 300,
+            "poll_interval": 1
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    // 3. Mock Cloud Backend: Poll: 1st Pending, 2nd Approved
+    struct PendingThenApproveSeq {
+        count: std::sync::atomic::AtomicUsize,
+    }
+    impl wiremock::Respond for PendingThenApproveSeq {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let prev = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if prev == 0 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "pending"
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "approved",
+                    "agent_token": "token-alpha-live-999",
+                    "connection_id": "conn-alpha-live-999"
+                }))
+            }
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/poll"))
+        .respond_with(PendingThenApproveSeq {
+            count: std::sync::atomic::AtomicUsize::new(0),
+        })
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    // Start device login
+    let public_session = agent_state
+        .start_company_device_login("Alpha Dynamics", Some("guid-alpha-100"))
+        .await
+        .unwrap();
+    assert_eq!(public_session.user_code, "ALPH-1234");
+
+    // Poll until complete
+    let company = agent_state
+        .poll_company_device_login("Alpha Dynamics", Some("guid-alpha-100"))
+        .await
+        .unwrap();
+    assert_eq!(company, "Alpha Dynamics");
+
+    // Verify Vault token and profile
+    assert_eq!(
+        Vault::get_token_for("conn-alpha-live-999").unwrap(),
+        "token-alpha-live-999"
+    );
+
+    let status = agent_state.get_status().await;
+    assert!(status.paired);
+    assert_eq!(status.company_name, Some("Alpha Dynamics".into()));
+
+    let _ = Vault::delete_token_for("conn-alpha-live-999");
+    let _ = Vault::delete_connection_id();
+}
+
+#[tokio::test]
+async fn test_device_auth_polling_immediately_after_approval_e2e() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::delete_token();
+    let _ = Vault::delete_connection_id();
+
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Beta Global</NAME><ALTERID>50</ALTERID><GUID>guid-beta-50</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/initiate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-beta-code",
+            "user_code": "BETA-5678",
+            "verification_uri": "https://app.fininsight.io/device?user_code=BETA-5678",
+            "expires_in": 300,
+            "poll_interval": 1
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    // Direct immediate approval
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "approved",
+            "agent_token": "token-beta-fast-123",
+            "connection_id": "conn-beta-fast-123"
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    let _ = agent_state
+        .start_company_device_login("Beta Global", Some("guid-beta-50"))
+        .await
+        .unwrap();
+
+    let company = agent_state
+        .poll_company_device_login("Beta Global", Some("guid-beta-50"))
+        .await
+        .unwrap();
+    assert_eq!(company, "Beta Global");
+    assert_eq!(
+        Vault::get_token_for("conn-beta-fast-123").unwrap(),
+        "token-beta-fast-123"
+    );
+
+    let _ = Vault::delete_token_for("conn-beta-fast-123");
+    let _ = Vault::delete_connection_id();
+}
+
+#[tokio::test]
+async fn test_device_auth_already_consumed_request_preserves_existing_token() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    let _ = Vault::delete_token();
+    let _ = Vault::delete_connection_id();
+
+    let tally_server = MockServer::start().await;
+    let tally_port = tally_server.address().port();
+    let tally_xml = r#"<ENVELOPE><BODY><DATA><COLLECTION>
+    <COMPANY><NAME>Gamma Industries</NAME><ALTERID>200</ALTERID><GUID>guid-gamma-200</GUID></COMPANY>
+    </COLLECTION></DATA></BODY></ENVELOPE>"#;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tally_xml))
+        .mount(&tally_server)
+        .await;
+
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/initiate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dev-gamma-consumed",
+            "user_code": "GAMM-9999",
+            "verification_uri": "https://app.fininsight.io/device?user_code=GAMM-9999",
+            "expires_in": 300,
+            "poll_interval": 1
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    // Backend returns consumed status with existing connection_id
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/device/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "consumed",
+            "connection_id": "conn-gamma-pre-existing"
+        })))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_state = fininsight_tally_agent_lib::AgentState::with_options(
+        tally_port,
+        Some(cloud_server.uri()),
+        dir.path().join("cp.json"),
+    )
+    .unwrap();
+
+    // Store a pre-existing profile and token for Gamma Industries
+    let initial_profile = fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+        connection_id: "conn-gamma-pre-existing".into(),
+        company_guid: Some("guid-gamma-200".into()),
+        company_name: "Gamma Industries".into(),
+        paired_at: chrono::Utc::now().to_rfc3339(),
+    };
+    agent_state.profile_store.save(&initial_profile).unwrap();
+    Vault::store_token_for("conn-gamma-pre-existing", "existing-gamma-token-888").unwrap();
+
+    let _ = agent_state
+        .start_company_device_login("Gamma Industries", Some("guid-gamma-200"))
+        .await
+        .unwrap();
+
+    let company = agent_state
+        .poll_company_device_login("Gamma Industries", Some("guid-gamma-200"))
+        .await
+        .unwrap();
+    assert_eq!(company, "Gamma Industries");
+
+    // Existing token must still be preserved in vault
+    assert_eq!(
+        Vault::get_token_for("conn-gamma-pre-existing").unwrap(),
+        "existing-gamma-token-888"
+    );
+
+    let _ = Vault::delete_token_for("conn-gamma-pre-existing");
+    let _ = Vault::delete_connection_id();
+}
+
+#[tokio::test]
 async fn test_token_revocation_on_sync_clears_token_and_resets_status() {
     let _guard = VAULT_TEST_LOCK.lock().await;
     let _ = Vault::delete_token();

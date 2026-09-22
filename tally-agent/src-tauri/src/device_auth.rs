@@ -50,12 +50,21 @@ pub struct DeviceInitiateResponse {
     pub verificationUri: Option<String>,
     pub verification_url: Option<String>,
     pub verificationUrl: Option<String>,
-    pub expires_in: Option<u64>,
-    pub expiresIn: Option<u64>,
-    pub interval: Option<u64>,
-    pub poll_interval: Option<u64>,
-    pub pollInterval: Option<u64>,
-    pub poll_interval_secs: Option<u64>,
+    pub expires_in: Option<serde_json::Value>,
+    pub expiresIn: Option<serde_json::Value>,
+    pub interval: Option<serde_json::Value>,
+    pub poll_interval: Option<serde_json::Value>,
+    pub pollInterval: Option<serde_json::Value>,
+    pub poll_interval_secs: Option<serde_json::Value>,
+    pub data: Option<serde_json::Value>,
+}
+
+fn parse_u64_val(val: &Option<serde_json::Value>) -> Option<u64> {
+    match val {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 impl DeviceInitiateResponse {
@@ -63,6 +72,13 @@ impl DeviceInitiateResponse {
         self.device_code
             .clone()
             .or_else(|| self.deviceCode.clone())
+            .or_else(|| {
+                self.data.as_ref().and_then(|d| {
+                    d.get("device_code")
+                        .or_else(|| d.get("deviceCode"))
+                        .and_then(|v| v.as_str().map(String::from))
+                })
+            })
             .unwrap_or_default()
     }
 
@@ -70,6 +86,13 @@ impl DeviceInitiateResponse {
         self.user_code
             .clone()
             .or_else(|| self.userCode.clone())
+            .or_else(|| {
+                self.data.as_ref().and_then(|d| {
+                    d.get("user_code")
+                        .or_else(|| d.get("userCode"))
+                        .and_then(|v| v.as_str().map(String::from))
+                })
+            })
             .unwrap_or_default()
     }
 
@@ -79,21 +102,54 @@ impl DeviceInitiateResponse {
             .or_else(|| self.verificationUri.clone())
             .or_else(|| self.verification_url.clone())
             .or_else(|| self.verificationUrl.clone())
+            .or_else(|| {
+                self.data.as_ref().and_then(|d| {
+                    d.get("verification_uri")
+                        .or_else(|| d.get("verificationUri"))
+                        .or_else(|| d.get("verification_url"))
+                        .or_else(|| d.get("verificationUrl"))
+                        .and_then(|v| v.as_str().map(String::from))
+                })
+            })
             .unwrap_or_default()
     }
 
     pub fn expires_in(&self) -> u64 {
-        self.expires_in
-            .or(self.expiresIn)
+        parse_u64_val(&self.expires_in)
+            .or_else(|| parse_u64_val(&self.expiresIn))
+            .or_else(|| {
+                self.data.as_ref().and_then(|d| {
+                    let v = d.get("expires_in").or_else(|| d.get("expiresIn"));
+                    match v {
+                        Some(serde_json::Value::Number(n)) => n.as_u64(),
+                        Some(serde_json::Value::String(s)) => s.trim().parse::<u64>().ok(),
+                        _ => None,
+                    }
+                })
+            })
             .filter(|&v| v > 0)
             .unwrap_or(900)
     }
 
     pub fn interval(&self) -> Option<u64> {
-        self.interval
-            .or(self.poll_interval)
-            .or(self.pollInterval)
-            .or(self.poll_interval_secs)
+        parse_u64_val(&self.interval)
+            .or_else(|| parse_u64_val(&self.poll_interval))
+            .or_else(|| parse_u64_val(&self.pollInterval))
+            .or_else(|| parse_u64_val(&self.poll_interval_secs))
+            .or_else(|| {
+                self.data.as_ref().and_then(|d| {
+                    let v = d
+                        .get("interval")
+                        .or_else(|| d.get("poll_interval"))
+                        .or_else(|| d.get("pollInterval"))
+                        .or_else(|| d.get("poll_interval_secs"));
+                    match v {
+                        Some(serde_json::Value::Number(n)) => n.as_u64(),
+                        Some(serde_json::Value::String(s)) => s.trim().parse::<u64>().ok(),
+                        _ => None,
+                    }
+                })
+            })
     }
 }
 
@@ -221,6 +277,13 @@ pub async fn initiate_device_auth_with_prev_cid(
     let poll_interval_secs = resp.interval().unwrap_or(5).max(1);
     let expires_at = Instant::now() + Duration::from_secs(resp.expires_in());
 
+    log::info!(
+        "[device_auth] Session initiated (user_code: {}, poll_interval: {}s, expires_in: {}s)",
+        resp.user_code(),
+        poll_interval_secs,
+        resp.expires_in()
+    );
+
     Ok(DeviceAuthSession {
         device_code: resp.device_code(),
         user_code: resp.user_code(),
@@ -245,6 +308,16 @@ pub async fn poll_device_auth(
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    let token_present = resp.extract_token().is_some();
+    let conn_id = resp.extract_connection_id();
+
+    log::debug!(
+        "[device_auth] Poll response received: status='{}', token_present={}, connection_id='{}'",
+        status_str,
+        token_present,
+        if conn_id.is_empty() { "<none>" } else { &conn_id }
+    );
+
     match status_str.as_str() {
         "pending" | "authorization_pending" | "waiting" => Ok(DeviceAuthStatus::Pending),
         "slow_down" | "slowdown" => Ok(DeviceAuthStatus::SlowDown),
@@ -254,13 +327,21 @@ pub async fn poll_device_auth(
             if let Some(token) = resp.extract_token() {
                 Ok(DeviceAuthStatus::Approved {
                     agent_token: token,
-                    connection_id: resp.extract_connection_id(),
+                    connection_id: conn_id,
                 })
-            } else if status_str == "already_completed" || status_str == "already_approved" || status_str == "completed" {
-                // Return Approved with empty token or existing connection id if already completed
+            } else if matches!(
+                status_str.as_str(),
+                "already_completed" | "already_approved" | "completed" | "consumed" | "paired" | "finalized"
+            ) {
+                // Return Approved with empty token or existing connection id if already completed/consumed
+                log::info!(
+                    "[device_auth] Request marked '{}' without new token payload; proceeding with connection_id='{}'",
+                    status_str,
+                    if conn_id.is_empty() { "<none>" } else { &conn_id }
+                );
                 Ok(DeviceAuthStatus::Approved {
                     agent_token: String::new(),
-                    connection_id: resp.extract_connection_id(),
+                    connection_id: conn_id,
                 })
             } else {
                 Err(ApiError::InvalidResponse(
@@ -273,7 +354,7 @@ pub async fn poll_device_auth(
             if let Some(token) = resp.extract_token() {
                 Ok(DeviceAuthStatus::Approved {
                     agent_token: token,
-                    connection_id: resp.extract_connection_id(),
+                    connection_id: conn_id,
                 })
             } else if status_str.is_empty() {
                 Ok(DeviceAuthStatus::Pending)
@@ -297,23 +378,46 @@ pub async fn poll_until_complete(
     session: &DeviceAuthSession,
 ) -> Result<DeviceAuthStatus, ApiError> {
     let mut current_interval = session.poll_interval_secs;
+    let mut iteration: u32 = 0;
+
+    log::info!(
+        "[device_auth] Starting device authorization polling loop (interval: {}s)",
+        current_interval
+    );
 
     loop {
-        if Instant::now() >= session.expires_at {
-            log::warn!("Device authorization session reached local expiration ceiling");
+        iteration = iteration.saturating_add(1);
+        let now = Instant::now();
+
+        if now >= session.expires_at {
+            log::warn!(
+                "[device_auth] Device authorization session reached local expiration ceiling (iteration: {})",
+                iteration
+            );
             return Ok(DeviceAuthStatus::Expired);
         }
+
+        let remaining_secs = session.expires_at.saturating_duration_since(now).as_secs();
+        log::debug!(
+            "[device_auth] Poll iteration #{} sleeping for {}s (remaining TTL: {}s)...",
+            iteration,
+            current_interval,
+            remaining_secs
+        );
 
         tokio::time::sleep(Duration::from_secs(current_interval)).await;
 
         if Instant::now() >= session.expires_at {
-            log::warn!("Device authorization session expired while waiting to poll");
+            log::warn!(
+                "[device_auth] Device authorization session expired while waiting to poll (iteration: {})",
+                iteration
+            );
             return Ok(DeviceAuthStatus::Expired);
         }
 
         match poll_device_auth(cloud_client, &session.device_code).await {
             Ok(DeviceAuthStatus::Pending) => {
-                log::debug!("Device auth status: Pending");
+                log::debug!("[device_auth] Poll iteration #{}: status is Pending, continuing poll loop", iteration);
                 continue;
             }
             Ok(DeviceAuthStatus::SlowDown) => {
@@ -321,29 +425,40 @@ pub async fn poll_until_complete(
                     .saturating_add(5)
                     .min(MAX_POLL_INTERVAL_SECS);
                 log::info!(
-                    "Device auth SlowDown received: increased poll interval to {}s (capped at {}s)",
+                    "[device_auth] Poll iteration #{}: SlowDown received; increased interval to {}s (capped at {}s)",
+                    iteration,
                     current_interval,
                     MAX_POLL_INTERVAL_SECS
                 );
                 continue;
             }
             Ok(DeviceAuthStatus::Approved { agent_token, connection_id }) => {
-                log::info!("Device auth Approved");
+                let has_token = !agent_token.is_empty();
+                log::info!(
+                    "[device_auth] Device authorization Approved on iteration #{} (has_token={}, connection_id='{}')",
+                    iteration,
+                    has_token,
+                    if connection_id.is_empty() { "<auto-generate>" } else { &connection_id }
+                );
                 return Ok(DeviceAuthStatus::Approved {
                     agent_token,
                     connection_id,
                 });
             }
             Ok(DeviceAuthStatus::Denied) => {
-                log::warn!("Device auth Denied by user");
+                log::warn!("[device_auth] Device authorization Denied by user (iteration: {})", iteration);
                 return Ok(DeviceAuthStatus::Denied);
             }
             Ok(DeviceAuthStatus::Expired) => {
-                log::warn!("Device auth Expired on backend");
+                log::warn!("[device_auth] Device authorization Expired on backend (iteration: {})", iteration);
                 return Ok(DeviceAuthStatus::Expired);
             }
             Err(e) => {
-                log::error!("Device auth poll network/API error: {}", redact(&e.to_string()));
+                log::error!(
+                    "[device_auth] Device auth poll network/API error on iteration #{}: {}",
+                    iteration,
+                    redact(&e.to_string())
+                );
                 return Err(e);
             }
         }
@@ -655,5 +770,90 @@ mod tests {
         let interval_at_max = 60u64;
         let capped_at_max = interval_at_max.saturating_add(5).min(MAX_POLL_INTERVAL_SECS);
         assert_eq!(capped_at_max, MAX_POLL_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn test_device_initiate_response_nested_data_and_string_values() {
+        let nested_json = serde_json::json!({
+            "data": {
+                "device_code": "dev-nested-123",
+                "user_code": "USER-NESTED",
+                "verification_uri": "https://app.fininsight.io/device?user_code=USER-NESTED",
+                "expires_in": "600",
+                "poll_interval": "5"
+            }
+        });
+
+        let resp: DeviceInitiateResponse = serde_json::from_value(nested_json).unwrap();
+        assert_eq!(resp.device_code(), "dev-nested-123");
+        assert_eq!(resp.user_code(), "USER-NESTED");
+        assert_eq!(resp.verification_uri(), "https://app.fininsight.io/device?user_code=USER-NESTED");
+        assert_eq!(resp.expires_in(), 600);
+        assert_eq!(resp.interval(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_poll_consumed_request_without_new_token_returns_approved() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/device/poll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "consumed",
+                "connection_id": "conn-existing-444"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri()).unwrap();
+        let session = DeviceAuthSession {
+            device_code: "dev-consumed".into(),
+            user_code: "USER-CONS".into(),
+            verification_uri: "http://example.com/device".into(),
+            poll_interval_secs: 1,
+            expires_at: Instant::now() + Duration::from_secs(10),
+        };
+
+        let result = poll_until_complete(&client, &session).await.unwrap();
+        match result {
+            DeviceAuthStatus::Approved { agent_token, connection_id } => {
+                assert!(agent_token.is_empty(), "Token should be empty for consumed response without payload");
+                assert_eq!(connection_id, "conn-existing-444");
+            }
+            other => panic!("Expected Approved, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_immediately_approved_on_first_attempt() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/device/poll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "approved",
+                "agent_token": "token-fast-approve",
+                "connection_id": "conn-fast-111"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri()).unwrap();
+        let session = DeviceAuthSession {
+            device_code: "dev-fast".into(),
+            user_code: "USER-FAST".into(),
+            verification_uri: "http://example.com/device".into(),
+            poll_interval_secs: 1,
+            expires_at: Instant::now() + Duration::from_secs(10),
+        };
+
+        let result = poll_until_complete(&client, &session).await.unwrap();
+        match result {
+            DeviceAuthStatus::Approved { agent_token, connection_id } => {
+                assert_eq!(agent_token, "token-fast-approve");
+                assert_eq!(connection_id, "conn-fast-111");
+            }
+            other => panic!("Expected Approved, got {:?}", other),
+        }
     }
 }
