@@ -154,9 +154,20 @@ impl ProfileStore {
 
     pub fn save(&self, profile: &ConnectionProfile) -> Result<(), ProfileError> {
         let mut profiles = self.load_all().unwrap_or_default();
+        let target_guid = profile.company_guid.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let target_name = profile.company_name.trim();
+
         if let Some(pos) = profiles.iter().position(|p| {
-            p.connection_id == profile.connection_id
-                || (profile.company_guid.is_some() && p.company_guid == profile.company_guid)
+            if p.connection_id == profile.connection_id {
+                return true;
+            }
+            if let (Some(g1), Some(g2)) = (target_guid, p.company_guid.as_deref().map(str::trim).filter(|s| !s.is_empty())) {
+                return g1.eq_ignore_ascii_case(g2);
+            }
+            if target_guid.is_none() && p.company_guid.is_none() {
+                return p.company_name.trim().eq_ignore_ascii_case(target_name);
+            }
+            false
         }) {
             profiles[pos] = profile.clone();
         } else {

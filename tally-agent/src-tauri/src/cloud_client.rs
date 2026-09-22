@@ -146,6 +146,74 @@ pub struct CloudClient {
     bearer_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(non_snake_case)]
+struct BackendErrorPayload {
+    code: Option<String>,
+    error: Option<serde_json::Value>,
+    message: Option<String>,
+}
+
+fn is_explicit_token_revocation(status: reqwest::StatusCode, body: &str) -> bool {
+    if status.as_u16() != 401 {
+        return false;
+    }
+    let body_trimmed = body.trim();
+    if body_trimmed.is_empty() {
+        return true;
+    }
+
+    // HTML / XML responses indicate an upstream proxy, CDN, or gateway error rather than an API token rejection
+    if body_trimmed.starts_with("<!DOCTYPE")
+        || body_trimmed.starts_with("<html")
+        || body_trimmed.starts_with("<?xml")
+    {
+        return false;
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<BackendErrorPayload>(body_trimmed) {
+        let code = parsed.code.as_deref().unwrap_or("").to_ascii_uppercase();
+        let msg = parsed.message.as_deref().unwrap_or("").to_ascii_lowercase();
+
+        let error_str = match &parsed.error {
+            Some(serde_json::Value::String(s)) => s.to_ascii_lowercase(),
+            Some(serde_json::Value::Object(map)) => {
+                map.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            }
+            _ => String::new(),
+        };
+
+        if matches!(
+            code.as_str(),
+            "UNAUTHORIZED" | "TOKEN_REVOKED" | "TOKEN_EXPIRED" | "INVALID_TOKEN" | "CONNECTION_REVOKED"
+        ) {
+            return true;
+        }
+
+        if msg.contains("invalid")
+            || msg.contains("revoked")
+            || msg.contains("expired")
+            || msg.contains("unauthorized")
+            || error_str.contains("invalid")
+            || error_str.contains("revoked")
+            || error_str.contains("expired")
+            || error_str.contains("unauthorized")
+        {
+            return true;
+        }
+    }
+
+    let lower = body_trimmed.to_ascii_lowercase();
+    lower.contains("invalid")
+        || lower.contains("revoked")
+        || lower.contains("expired")
+        || lower.contains("unauthorized")
+        || !body_trimmed.starts_with('{')
+}
+
 impl CloudClient {
     pub fn new() -> Result<Self, ApiError> {
         let base = api_base_url();
@@ -187,7 +255,10 @@ impl CloudClient {
 
     async fn bearer_token(&self) -> Result<String, ApiError> {
         if let Some(ref t) = self.bearer_token {
-            return Ok(t.clone());
+            let clean = t.trim();
+            if !clean.is_empty() {
+                return Ok(clean.to_string());
+            }
         }
         Vault::get_token().map_err(|_| ApiError::NotPaired)
     }
@@ -302,6 +373,7 @@ impl CloudClient {
     /// POST /api/v1/agent/sync/delta — bearer auth, one-way push for initial batches.
     pub async fn push_initial_batch(&self, batch: &SyncBatchPayload) -> Result<(), ApiError> {
         let token = self.bearer_token().await?;
+        let has_token = !token.is_empty();
         let resp = self
             .http
             .post(self.url("/api/v1/agent/sync/delta"))
@@ -313,23 +385,28 @@ impl CloudClient {
 
         let status = resp.status();
         log::debug!(
-            "[cloud_client] Initial batch {}/{} response HTTP {}",
+            "[cloud_client] POST /api/v1/agent/sync/delta (initial batch {}/{}) -> HTTP {} (token_present: {})",
             batch.batch_index + 1,
             batch.total_batches,
-            status
+            status,
+            has_token
         );
-
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            log::warn!(
-                "Initial batch push returned HTTP {} - token revoked or unauthorized",
-                status
-            );
-            return Err(ApiError::TokenRevoked);
-        }
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            log::warn!("[cloud_client] Initial batch failed body: {}", redact(&body));
+            if is_explicit_token_revocation(status, &body) {
+                log::warn!(
+                    "[cloud_client] Initial batch push returned HTTP {} with confirmed token revocation (body: {})",
+                    status,
+                    redact(&body)
+                );
+                return Err(ApiError::TokenRevoked);
+            }
+            log::warn!(
+                "[cloud_client] Initial batch failed with HTTP {} (body: {})",
+                status,
+                redact(&body)
+            );
             return Err(ApiError::SyncFailed(status.as_u16()));
         }
         Ok(())
@@ -338,6 +415,7 @@ impl CloudClient {
     /// POST /api/v1/agent/sync/delta — bearer auth, one-way push.
     pub async fn push_delta(&self, payload: &DeltaSyncPayload) -> Result<(), ApiError> {
         let token = self.bearer_token().await?;
+        let has_token = !token.is_empty();
         let resp = self
             .http
             .post(self.url("/api/v1/agent/sync/delta"))
@@ -348,19 +426,28 @@ impl CloudClient {
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
         let status = resp.status();
-        log::debug!("[cloud_client] Delta sync response HTTP {}", status);
-
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            log::warn!(
-                "Delta sync push returned HTTP {} - token revoked or unauthorized",
-                status
-            );
-            return Err(ApiError::TokenRevoked);
-        }
+        log::debug!(
+            "[cloud_client] POST /api/v1/agent/sync/delta (records: {}) -> HTTP {} (token_present: {})",
+            payload.records.len(),
+            status,
+            has_token
+        );
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            log::warn!("[cloud_client] Delta sync failed body: {}", redact(&body));
+            if is_explicit_token_revocation(status, &body) {
+                log::warn!(
+                    "[cloud_client] Delta sync push returned HTTP {} with confirmed token revocation (body: {})",
+                    status,
+                    redact(&body)
+                );
+                return Err(ApiError::TokenRevoked);
+            }
+            log::warn!(
+                "[cloud_client] Delta sync failed with HTTP {} (body: {})",
+                status,
+                redact(&body)
+            );
             return Err(ApiError::SyncFailed(status.as_u16()));
         }
         Ok(())
@@ -369,6 +456,7 @@ impl CloudClient {
     /// POST /api/v1/agent/heartbeat — reports liveness only, may return sync_requested flag.
     pub async fn heartbeat(&self, payload: &HeartbeatPayload) -> Result<HeartbeatResponse, ApiError> {
         let token = self.bearer_token().await?;
+        let has_token = !token.is_empty();
         let resp = self
             .http
             .post(self.url("/api/v1/agent/heartbeat"))
@@ -378,13 +466,29 @@ impl CloudClient {
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
-        if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-            log::warn!("Heartbeat returned HTTP {} - token revoked or unauthorized", resp.status());
-            return Err(ApiError::TokenRevoked);
-        }
+        let status = resp.status();
+        log::debug!(
+            "[cloud_client] POST /api/v1/agent/heartbeat -> HTTP {} (token_present: {})",
+            status,
+            has_token
+        );
 
-        if !resp.status().is_success() {
-            return Err(ApiError::HeartbeatFailed(resp.status().as_u16()));
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if is_explicit_token_revocation(status, &body) {
+                log::warn!(
+                    "[cloud_client] Heartbeat returned HTTP {} with confirmed token revocation (body: {})",
+                    status,
+                    redact(&body)
+                );
+                return Err(ApiError::TokenRevoked);
+            }
+            log::warn!(
+                "[cloud_client] Heartbeat non-auth failure HTTP {} (body: {})",
+                status,
+                redact(&body)
+            );
+            return Err(ApiError::HeartbeatFailed(status.as_u16()));
         }
 
         resp.json::<HeartbeatResponse>()

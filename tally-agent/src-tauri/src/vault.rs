@@ -18,40 +18,44 @@ impl Vault {
     }
 
     pub fn store_token_for(connection_id: &str, token: &str) -> Result<(), VaultError> {
-        let account = Self::token_account_for(connection_id);
-        let entry = Self::entry_for(&account)?;
-        entry.set_password(token).map_err(|e| VaultError::Keyring(e.to_string()))?;
-        // Clean up legacy single token if present
-        if let Ok(legacy) = Self::entry_for(LEGACY_TOKEN_ACCOUNT) {
-            let _ = legacy.delete_credential();
+        let clean_cid = connection_id.trim();
+        let clean_tok = token.trim();
+        if clean_cid.is_empty() || clean_tok.is_empty() {
+            return Err(VaultError::NotFound);
         }
-        Ok(())
+        let account = Self::token_account_for(clean_cid);
+        let entry = Self::entry_for(&account)?;
+        entry.set_password(clean_tok).map_err(|e| VaultError::Keyring(e.to_string()))
     }
 
     pub fn get_token_for(connection_id: &str) -> Result<String, VaultError> {
-        let account = Self::token_account_for(connection_id);
+        let clean_cid = connection_id.trim();
+        if clean_cid.is_empty() {
+            return Err(VaultError::NotFound);
+        }
+        let account = Self::token_account_for(clean_cid);
         let entry = Self::entry_for(&account)?;
         match entry.get_password() {
             Ok(token) => {
                 let trimmed = token.trim().to_string();
                 if !trimmed.is_empty() {
-                    return Ok(trimmed);
+                    Ok(trimmed)
+                } else {
+                    Err(VaultError::NotFound)
                 }
             }
-            Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(VaultError::Keyring(e.to_string())),
+            Err(keyring::Error::NoEntry) => Err(VaultError::NotFound),
+            Err(e) => Err(VaultError::Keyring(e.to_string())),
         }
-
-        Err(VaultError::NotFound)
     }
 
     pub fn delete_token_for(connection_id: &str) -> Result<(), VaultError> {
-        let account = Self::token_account_for(connection_id);
-        if let Ok(entry) = Self::entry_for(&account) {
-            let _ = entry.delete_credential();
-        }
-        if let Ok(legacy) = Self::entry_for(LEGACY_TOKEN_ACCOUNT) {
-            let _ = legacy.delete_credential();
+        let clean_cid = connection_id.trim();
+        if !clean_cid.is_empty() {
+            let account = Self::token_account_for(clean_cid);
+            if let Ok(entry) = Self::entry_for(&account) {
+                let _ = entry.delete_credential();
+            }
         }
         Ok(())
     }

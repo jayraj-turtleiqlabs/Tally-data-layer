@@ -2518,5 +2518,212 @@ async fn test_discovery_reconciliation_lifecycle() {
     let _ = Vault::delete_token_for("conn-profit");
 }
 
+#[tokio::test]
+async fn test_token_stored_and_retrieved_under_same_connection_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+    let state = fininsight_tally_agent_lib::AgentState::with_options(9000, None, profile_path).unwrap();
+
+    let cid = "conn-e2e-demo-1";
+    let token = "agt_secret_token_123456789";
+
+    // 1. Complete pairing
+    let paired_name = state.complete_pairing_for_company(
+        cid,
+        token,
+        "DemoCorp",
+        Some("guid-demo-1"),
+    ).await.unwrap();
+    assert_eq!(paired_name, "DemoCorp");
+
+    // 2. Verify exact connection_id stored in profile
+    let profile = state.profile_store.get_by_connection_id(cid).unwrap().unwrap();
+    assert_eq!(profile.connection_id, cid);
+    assert_eq!(profile.company_name, "DemoCorp");
+    assert_eq!(profile.company_guid.as_deref(), Some("guid-demo-1"));
+
+    // 3. Verify agent_token stored in OS Vault under SAME connection_id
+    let retrieved_token = Vault::get_token_for(cid).unwrap();
+    assert_eq!(retrieved_token, token);
+
+    // Cleanup
+    let _ = state.disconnect_company(cid).await;
+}
+
+#[tokio::test]
+async fn test_re_pairing_replaces_old_profile_and_cleans_up_obsolete_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+    let state = fininsight_tally_agent_lib::AgentState::with_options(9000, None, profile_path).unwrap();
+
+    let old_cid = "conn-old-111";
+    let old_token = "agt_old_token_111";
+
+    // Pair first time
+    state.complete_pairing_for_company(
+        old_cid,
+        old_token,
+        "DemoCorp",
+        Some("guid-demo-same"),
+    ).await.unwrap();
+
+    assert_eq!(state.profile_store.load_all().unwrap().len(), 1);
+    assert_eq!(Vault::get_token_for(old_cid).unwrap(), old_token);
+
+    // Re-pair with a NEW connection ID and NEW token
+    let new_cid = "conn-new-222";
+    let new_token = "agt_new_token_222";
+
+    state.complete_pairing_for_company(
+        new_cid,
+        new_token,
+        "DemoCorp",
+        Some("guid-demo-same"),
+    ).await.unwrap();
+
+    // Verify there is still ONLY 1 profile for DemoCorp, with the NEW connection ID
+    let all_profiles = state.profile_store.load_all().unwrap();
+    assert_eq!(all_profiles.len(), 1, "Must not duplicate connection profiles on re-pairing");
+    assert_eq!(all_profiles[0].connection_id, new_cid);
+    assert_eq!(all_profiles[0].company_name, "DemoCorp");
+
+    // Verify new token is stored in vault
+    assert_eq!(Vault::get_token_for(new_cid).unwrap(), new_token);
+
+    // Verify obsolete old token was cleaned up
+    assert!(Vault::get_token_for(old_cid).is_err(), "Old token must be deleted on re-pairing");
+
+    // Cleanup
+    let _ = state.disconnect_company(new_cid).await;
+}
+
+#[tokio::test]
+async fn test_multicompany_token_isolation_democorp_and_profitcorp() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+    let state = fininsight_tally_agent_lib::AgentState::with_options(9000, None, profile_path).unwrap();
+
+    let cid_a = "conn-democorp-a";
+    let token_a = "agt_token_democorp_aaa";
+    let cid_b = "conn-profitcorp-b";
+    let token_b = "agt_token_profitcorp_bbb";
+
+    state.complete_pairing_for_company(cid_a, token_a, "DemoCorp", Some("guid-a")).await.unwrap();
+    state.complete_pairing_for_company(cid_b, token_b, "ProfitCorp", Some("guid-b")).await.unwrap();
+
+    // Profiles exist independently
+    let all = state.profile_store.load_all().unwrap();
+    assert_eq!(all.len(), 2);
+
+    // Verify DemoCorp gets token A, ProfitCorp gets token B
+    assert_eq!(Vault::get_token_for(cid_a).unwrap(), token_a);
+    assert_eq!(Vault::get_token_for(cid_b).unwrap(), token_b);
+    assert_ne!(Vault::get_token_for(cid_a).unwrap(), Vault::get_token_for(cid_b).unwrap());
+
+    // Cleanup
+    let _ = state.disconnect_company(cid_a).await;
+    let _ = state.disconnect_company(cid_b).await;
+}
+
+#[tokio::test]
+async fn test_restart_persistence_loads_profiles_and_retrieves_vault_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+
+    let cid = "conn-restart-test";
+    let token = "agt_restart_token_999";
+
+    // 1. First agent instance pairs company
+    {
+        let state1 = fininsight_tally_agent_lib::AgentState::with_options(9000, None, profile_path.clone()).unwrap();
+        state1.complete_pairing_for_company(cid, token, "RestartCorp", Some("guid-restart")).await.unwrap();
+    }
+
+    // 2. Simulate agent close & restart: create fresh AgentState pointing to same profile_path
+    {
+        let state2 = fininsight_tally_agent_lib::AgentState::with_options(9000, None, profile_path.clone()).unwrap();
+        let profiles = state2.profile_store.load_all().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].connection_id, cid);
+        assert_eq!(profiles[0].company_name, "RestartCorp");
+
+        // Verify Vault token exists for the restored profile
+        let restored_token = Vault::get_token_for(&profiles[0].connection_id).unwrap();
+        assert_eq!(restored_token, token);
+
+        let _ = state2.disconnect_company(cid).await;
+    }
+}
+
+#[tokio::test]
+async fn test_backend_401_explicit_revocation_vs_transient_failure() {
+    let server = MockServer::start().await;
+
+    // 1. Explicit 401 with UNAUTHORIZED JSON body -> ApiError::TokenRevoked
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/heartbeat"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "code": "UNAUTHORIZED",
+            "message": "Invalid agent authorization token"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = CloudClient::from_base_url(&server.uri())
+        .unwrap()
+        .with_token("revoked-token");
+
+    let payload = fininsight_tally_agent_lib::cloud_client::HeartbeatPayload {
+        tally_reachable: true,
+        agent_version: "1.0.0".into(),
+        last_known_alter_id: 0,
+    };
+
+    let err = client.heartbeat(&payload).await.unwrap_err();
+    assert!(matches!(err, fininsight_tally_agent_lib::errors::ApiError::TokenRevoked));
+
+    // 2. Non-auth 401 (e.g. gateway HTML or proxy) -> HeartbeatFailed(401), NOT TokenRevoked
+    let server2 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/heartbeat"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("<html><body>Proxy Auth Required</body></html>"))
+        .mount(&server2)
+        .await;
+
+    let client2 = CloudClient::from_base_url(&server2.uri())
+        .unwrap()
+        .with_token("valid-token");
+
+    let err2 = client2.heartbeat(&payload).await.unwrap_err();
+    assert!(matches!(err2, fininsight_tally_agent_lib::errors::ApiError::HeartbeatFailed(401)));
+}
+
+#[tokio::test]
+async fn test_tally_offline_preserves_profile_token_and_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+    // Pick an unused port where no Tally is running
+    let state = fininsight_tally_agent_lib::AgentState::with_options(59999, None, profile_path).unwrap();
+
+    let cid = "conn-offline-test";
+    let token = "agt_offline_token_333";
+
+    state.complete_pairing_for_company(cid, token, "OfflineCorp", Some("guid-offline")).await.unwrap();
+
+    // Sync Now when Tally is offline
+    let sync_res = state.sync_now().await;
+    assert!(sync_res.is_err(), "Sync must fail when Tally is offline");
+
+    // Verify profile, token, and checkpoint are completely preserved
+    assert_eq!(state.profile_store.load_all().unwrap().len(), 1);
+    assert_eq!(state.profile_store.get_by_connection_id(cid).unwrap().unwrap().company_name, "OfflineCorp");
+    assert_eq!(Vault::get_token_for(cid).unwrap(), token);
+
+    let cp_store = state.checkpoint_store_for_connection(cid);
+    assert!(cp_store.load().is_ok());
+
+    let _ = state.disconnect_company(cid).await;
+}
+
 
 

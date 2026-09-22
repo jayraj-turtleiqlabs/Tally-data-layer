@@ -540,50 +540,79 @@ impl AgentState {
         company_name: &str,
         company_guid: Option<&str>,
     ) -> Result<String, AgentError> {
+        let clean_cid = connection_id.trim();
+        let clean_name = company_name.trim();
+
         // Check if this company already had a previous profile
         let existing_profile = self
             .profile_store
-            .get_by_guid_or_name(company_guid, company_name)
+            .get_by_guid_or_name(company_guid, clean_name)
             .ok()
             .flatten();
 
         let profile = ConnectionProfile {
-            connection_id: connection_id.to_string(),
-            company_guid: company_guid.map(String::from),
-            company_name: company_name.to_string(),
+            connection_id: clean_cid.to_string(),
+            company_guid: company_guid.map(|s| s.trim().to_string()),
+            company_name: clean_name.to_string(),
             paired_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        log::info!("[pair] Saving connection profile for '{}' (cid: {})...", company_name, connection_id);
+        log::info!(
+            "[pair] Saving connection profile for company='{}', connection_id='{}', GUID={:?}",
+            clean_name,
+            clean_cid,
+            company_guid
+        );
+
+        // If this company previously had a profile with a different connection ID, clean up old profile and obsolete vault credentials
+        if let Some(ref old_prof) = existing_profile {
+            if old_prof.connection_id != clean_cid {
+                log::info!(
+                    "[pair] Replacing previous connection {} with {} for '{}'",
+                    old_prof.connection_id,
+                    clean_cid,
+                    clean_name
+                );
+                let _ = self.profile_store.delete_for_connection(&old_prof.connection_id);
+                if !token.trim().is_empty() {
+                    let _ = Vault::delete_token_for(&old_prof.connection_id);
+                }
+                self.per_company_errors.write().await.remove(&old_prof.connection_id);
+            }
+        }
+
         self.profile_store.save(&profile)?;
 
-        if !token.is_empty() {
-            log::info!("[pair] Storing agent token in vault for connection {}...", connection_id);
-            Vault::store_token_for(connection_id, token)?;
+        if !token.trim().is_empty() {
+            log::info!("[pair] Storing fresh agent token in vault for connection_id='{}'...", clean_cid);
+            Vault::store_token_for(clean_cid, token)?;
         } else if let Some(ref old_prof) = existing_profile {
             if let Ok(old_tok) = Vault::get_token_for(&old_prof.connection_id) {
                 log::info!(
                     "[pair] Preserving existing vault token from connection {} for connection {}...",
                     old_prof.connection_id,
-                    connection_id
+                    clean_cid
                 );
-                let _ = Vault::store_token_for(connection_id, &old_tok);
+                let _ = Vault::store_token_for(clean_cid, &old_tok);
             }
         }
-        let _ = Vault::store_connection_id(connection_id);
+        let _ = Vault::store_connection_id(clean_cid);
 
-        let conn_checkpoint_store = self.checkpoint_store_for_connection(connection_id);
+        // Clear any previous cached errors for this connection
+        self.per_company_errors.write().await.remove(clean_cid);
+
+        let conn_checkpoint_store = self.checkpoint_store_for_connection(clean_cid);
         if !conn_checkpoint_store.path().exists() {
             // Check if we can preserve existing checkpoint from a previous connection for this company
             let mut cp_to_save = Checkpoint {
-                connection_id: Some(connection_id.to_string()),
+                connection_id: Some(clean_cid.to_string()),
                 last_known_alter_id: 0,
                 last_successful_sync: None,
                 backfill_complete: false,
             };
 
             if let Some(old_prof) = existing_profile {
-                if old_prof.connection_id != connection_id {
+                if old_prof.connection_id != clean_cid {
                     let old_cp_store = self.checkpoint_store_for_connection(&old_prof.connection_id);
                     if let Ok(old_cp) = old_cp_store.load() {
                         if old_cp.last_known_alter_id > 0 || old_cp.backfill_complete {
@@ -591,10 +620,10 @@ impl AgentState {
                                 "[pair] Preserving existing checkpoint (alter_id: {}) from previous connection {} for '{}'",
                                 old_cp.last_known_alter_id,
                                 old_prof.connection_id,
-                                company_name
+                                clean_name
                             );
                             cp_to_save = old_cp;
-                            cp_to_save.connection_id = Some(connection_id.to_string());
+                            cp_to_save.connection_id = Some(clean_cid.to_string());
                         }
                     }
                 }
@@ -608,7 +637,7 @@ impl AgentState {
         // after strict GUID verification against Tally's active company.
 
         let _ = self.discover_and_merge_companies().await;
-        Ok(company_name.to_string())
+        Ok(clean_name.to_string())
     }
 
     pub async fn cancel_device_login(&self) {
@@ -866,21 +895,27 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
 
                         match cloud.heartbeat(&payload).await {
                             Ok(resp) => {
+                                log::debug!(
+                                    "[heartbeat] Acknowledged for connection_id='{}' (company='{}', is_active={})",
+                                    cid,
+                                    profile.company_name,
+                                    is_active
+                                );
                                 if resp.is_sync_requested() {
                                     if is_active {
-                                        log::info!("Dashboard requested sync via heartbeat for connection {}", cid);
+                                        log::info!("[heartbeat] Dashboard requested sync via heartbeat for connection {}", cid);
                                         let _ = state.sync_company(cid).await;
                                     } else {
-                                        log::info!("Dashboard requested sync for connection {}, but company '{}' is not currently active in Tally", cid, profile.company_name);
+                                        log::info!("[heartbeat] Dashboard requested sync for connection {}, but company '{}' is not currently active in Tally", cid, profile.company_name);
                                     }
                                 }
                             }
                             Err(ApiError::TokenRevoked) => {
-                                log::warn!("Token revoked for connection {}", cid);
-                                let _ = state.disconnect_company(cid).await;
+                                log::warn!("[heartbeat] Confirmed token revocation from backend for connection_id='{}'. Clearing credentials.", cid);
+                                state.handle_token_revoked_for_connection(cid).await;
                             }
                             Err(e) => {
-                                log::debug!("Heartbeat error for connection {}: {:?}", cid, e);
+                                log::debug!("[heartbeat] Transient/non-auth heartbeat error for connection {}: {:?}", cid, e);
                             }
                         }
                     }
