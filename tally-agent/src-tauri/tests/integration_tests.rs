@@ -2725,5 +2725,142 @@ async fn test_tally_offline_preserves_profile_token_and_checkpoint() {
     let _ = state.disconnect_company(cid).await;
 }
 
+#[tokio::test]
+async fn test_sync_and_heartbeat_fail_not_paired_when_connection_token_missing_even_with_legacy_token() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+    // Set a legacy shared token in keyring
+    let _ = Vault::store_token("legacy-shared-token-must-not-be-used");
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+    let state = fininsight_tally_agent_lib::AgentState::with_options(9000, None, profile_path).unwrap();
+
+    let cid = "conn-missing-token-123";
+    state.profile_store.save(&fininsight_tally_agent_lib::checkpoint::ConnectionProfile {
+        connection_id: cid.into(),
+        company_guid: Some("guid-missing-tok".into()),
+        company_name: "MissingTokenCorp".into(),
+        paired_at: "2026-09-23T10:00:00Z".into(),
+    }).unwrap();
+
+    // Ensure NO per-connection token exists
+    let _ = Vault::delete_token_for(cid);
+
+    // 1. Sync must fail with NotPaired
+    let sync_res = state.sync_company(cid).await;
+    assert!(sync_res.is_err(), "Sync must fail when per-connection token is missing");
+    let err = sync_res.unwrap_err();
+    match err {
+        fininsight_tally_agent_lib::errors::AgentError::Api(fininsight_tally_agent_lib::errors::ApiError::NotPaired) => {}
+        other => panic!("Expected ApiError::NotPaired, got: {:?}", other),
+    }
+
+    // 2. CloudClient created for this connection must fail with NotPaired on heartbeat
+    let cloud = state.new_cloud_client().unwrap(); // No token attached
+    let hb_res = cloud.heartbeat(&fininsight_tally_agent_lib::cloud_client::HeartbeatPayload {
+        tally_reachable: false,
+        agent_version: "0.1.0".into(),
+        last_known_alter_id: 0,
+    }).await;
+    assert!(
+        matches!(hb_res, Err(fininsight_tally_agent_lib::errors::ApiError::NotPaired)),
+        "Heartbeat must fail with NotPaired when bearer_token is not attached, ignoring legacy token"
+    );
+
+    // Cleanup
+    let _ = state.disconnect_company(cid).await;
+    let _ = Vault::delete_token();
+}
+
+#[tokio::test]
+async fn test_disconnect_attempts_revoke_and_succeeds_even_if_backend_fails() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    // Mock Gateway backend where /api/v1/agent/revoke returns HTTP 404 (simulating unreleased backend endpoint)
+    let cloud_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/revoke"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&cloud_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+    let state = fininsight_tally_agent_lib::AgentState::with_options(
+        9000,
+        Some(cloud_server.uri()),
+        profile_path,
+    ).unwrap();
+
+    let cid = "conn-revoke-test-404";
+    let token = "agt_tok_revoke_404_test";
+    state.complete_pairing_for_company(cid, token, "RevokeCorp", Some("guid-revoke-404")).await.unwrap();
+
+    assert_eq!(Vault::get_token_for(cid).unwrap(), token);
+    assert_eq!(state.profile_store.load_all().unwrap().len(), 1);
+
+    // Disconnect must attempt revoke call, catch 404 cleanly, and complete local deletion without error
+    let disc_res = state.disconnect_company(cid).await;
+    assert!(disc_res.is_ok(), "disconnect_company must succeed even when backend returns 404: {:?}", disc_res);
+
+    // Verify local credentials deleted
+    assert!(Vault::get_token_for(cid).is_err(), "Local token must be deleted after disconnect");
+    assert_eq!(state.profile_store.load_all().unwrap().len(), 0, "Profile must be deleted");
+
+    // Verify backend received the revoke attempt with bearer token and connection_id
+    let reqs = cloud_server.received_requests().await.unwrap();
+    let revoke_reqs: Vec<_> = reqs.iter().filter(|r| r.url.path() == "/api/v1/agent/revoke").collect();
+    assert_eq!(revoke_reqs.len(), 1, "Must have dispatched exactly 1 revoke request");
+    let r = &revoke_reqs[0];
+    assert_eq!(r.headers.get("authorization").unwrap(), &format!("Bearer {}", token));
+    let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(body["connection_id"], cid);
+
+    let _ = Vault::delete_token();
+    let _ = Vault::delete_token_for(cid);
+}
+
+#[tokio::test]
+async fn test_client_side_backoff_on_repeated_sync_failure_and_reset_on_success() {
+    let _guard = VAULT_TEST_LOCK.lock().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("profiles.json");
+    let state = fininsight_tally_agent_lib::AgentState::with_options(9000, None, profile_path).unwrap();
+
+    let cid = "conn-backoff-test";
+
+    // Initially, no backoff
+    assert!(!state.should_backoff_connection(cid).await);
+
+    // Record failure 1 -> 60s
+    let dur1 = state.record_connection_failure(cid).await;
+    assert_eq!(dur1, std::time::Duration::from_secs(60));
+    assert!(state.should_backoff_connection(cid).await);
+
+    // Calling sync_company while backed off returns rate-limited error
+    let sync_res = state.sync_company(cid).await;
+    assert!(sync_res.is_err());
+    let err_msg = sync_res.unwrap_err().to_string();
+    assert!(err_msg.contains("rate-limited"), "Expected rate-limited error, got: {}", err_msg);
+
+    // Record failure 2 -> 120s
+    let dur2 = state.record_connection_failure(cid).await;
+    assert_eq!(dur2, std::time::Duration::from_secs(120));
+
+    // Record failure 3 -> 240s
+    let dur3 = state.record_connection_failure(cid).await;
+    assert_eq!(dur3, std::time::Duration::from_secs(240));
+
+    // Record failure 4 -> 300s (capped)
+    let dur4 = state.record_connection_failure(cid).await;
+    assert_eq!(dur4, std::time::Duration::from_secs(300));
+
+    // Success resets backoff immediately
+    state.record_connection_success(cid).await;
+    assert!(!state.should_backoff_connection(cid).await);
+}
+
+
 
 

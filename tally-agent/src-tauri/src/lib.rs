@@ -70,6 +70,59 @@ pub struct AgentStatus {
     pub backfill_complete: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConnectionBackoff {
+    pub consecutive_failures: u32,
+    pub next_allowed_attempt: std::time::Instant,
+}
+
+impl ConnectionBackoff {
+    pub const BASE_BACKOFF_SECS: u64 = 60;
+    pub const MAX_BACKOFF_SECS: u64 = 300;
+
+    pub fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            next_allowed_attempt: std::time::Instant::now(),
+        }
+    }
+
+    pub fn is_allowed(&self) -> bool {
+        std::time::Instant::now() >= self.next_allowed_attempt
+    }
+}
+
+impl Default for ConnectionBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnectionBackoff {
+
+    pub fn current_backoff_duration(&self) -> Duration {
+        if self.consecutive_failures == 0 {
+            Duration::from_secs(0)
+        } else {
+            let exp_factor = 2u64.saturating_pow(self.consecutive_failures.saturating_sub(1).min(6));
+            let secs = (Self::BASE_BACKOFF_SECS.saturating_mul(exp_factor)).min(Self::MAX_BACKOFF_SECS);
+            Duration::from_secs(secs)
+        }
+    }
+
+    pub fn record_failure(&mut self) -> Duration {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let duration = self.current_backoff_duration();
+        self.next_allowed_attempt = std::time::Instant::now() + duration;
+        duration
+    }
+
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_allowed_attempt = std::time::Instant::now();
+    }
+}
+
 pub struct AgentState {
     pub tally_port: u16,
     pub cloud_base_url: Option<String>,
@@ -82,6 +135,7 @@ pub struct AgentState {
     pub active_tally_company: RwLock<Option<CompanyInfo>>,
     pub per_company_errors: RwLock<HashMap<String, String>>,
     pub syncing_connections: RwLock<HashMap<String, bool>>,
+    pub connection_backoffs: RwLock<HashMap<String, ConnectionBackoff>>,
 }
 
 pub fn matches_company(
@@ -147,9 +201,9 @@ impl AgentState {
         };
 
         let token = if let Some(ref cid) = connection_id {
-            Vault::get_token_for(cid).or_else(|_| Vault::get_token()).ok()
+            Vault::get_token_for(cid).ok()
         } else {
-            Vault::get_token().ok()
+            None
         };
 
         if let Some(ref t) = token {
@@ -184,6 +238,7 @@ impl AgentState {
             active_tally_company: RwLock::new(None),
             per_company_errors: RwLock::new(HashMap::new()),
             syncing_connections: RwLock::new(HashMap::new()),
+            connection_backoffs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -202,6 +257,37 @@ impl AgentState {
             Some(url) => CloudClient::from_base_url(url),
             None => CloudClient::new(),
         }
+    }
+
+    pub async fn should_backoff_connection(&self, connection_id: &str) -> bool {
+        let backoffs = self.connection_backoffs.read().await;
+        if let Some(backoff) = backoffs.get(connection_id) {
+            !backoff.is_allowed()
+        } else {
+            false
+        }
+    }
+
+    pub async fn record_connection_failure(&self, connection_id: &str) -> Duration {
+        let mut backoffs = self.connection_backoffs.write().await;
+        let backoff = backoffs
+            .entry(connection_id.to_string())
+            .or_insert_with(ConnectionBackoff::new);
+        backoff.record_failure()
+    }
+
+    pub async fn record_connection_success(&self, connection_id: &str) {
+        let mut backoffs = self.connection_backoffs.write().await;
+        if let Some(backoff) = backoffs.get_mut(connection_id) {
+            backoff.record_success();
+        }
+    }
+
+    pub async fn get_connection_backoff_info(&self, connection_id: &str) -> Option<(u32, Duration)> {
+        let backoffs = self.connection_backoffs.read().await;
+        backoffs
+            .get(connection_id)
+            .map(|b| (b.consecutive_failures, b.current_backoff_duration()))
     }
 
     pub async fn check_tally_reachable(&self) -> bool {
@@ -467,7 +553,7 @@ impl AgentState {
         )
         .await?;
 
-        log::info!("[device_login] Opening browser to {}", &session.verification_uri);
+        log::info!("[device_login] Opening browser to {}", session.verification_uri);
         let browser_opened = opener::open(&session.verification_uri).is_ok();
 
         let public_info = DeviceAuthPublicSession {
@@ -647,6 +733,13 @@ impl AgentState {
 
     /// Syncs ONLY the requested connected company, verifying active Tally company by GUID first.
     pub async fn sync_company(&self, connection_id: &str) -> Result<SyncResult, AgentError> {
+        if self.should_backoff_connection(connection_id).await {
+            return Err(AgentError::Other(format!(
+                "Sync temporarily rate-limited due to repeated failures for connection {}",
+                connection_id
+            )));
+        }
+
         // Prevent concurrent syncs
         {
             let mut syncing = self.syncing_connections.write().await;
@@ -663,19 +756,28 @@ impl AgentState {
             syncing.remove(connection_id);
         }
 
-        // Update error or success tracking
+        // Update error or success tracking and rate-limit backoff
         {
             let mut errors = self.per_company_errors.write().await;
             match &result {
                 Ok(r) if r.success => {
+                    self.record_connection_success(connection_id).await;
                     errors.remove(connection_id);
                 }
                 Ok(r) => {
+                    self.record_connection_failure(connection_id).await;
                     if let Some(ref msg) = r.error_message {
                         errors.insert(connection_id.to_string(), msg.clone());
                     }
                 }
+                Err(AgentError::Api(ApiError::TokenRevoked)) => {
+                    // Handled separately below
+                }
+                Err(AgentError::Tally(crate::errors::TallyError::CompanyMismatch { .. })) => {
+                    // Company mismatch is a local Tally mismatch, not a backend failure
+                }
                 Err(e) => {
+                    self.record_connection_failure(connection_id).await;
                     errors.insert(connection_id.to_string(), e.to_string());
                 }
             }
@@ -693,7 +795,6 @@ impl AgentState {
             .ok_or_else(|| AgentError::Other(format!("Connection profile not found for {}", connection_id)))?;
 
         let token = Vault::get_token_for(connection_id)
-            .or_else(|_| Vault::get_token())
             .map_err(|_| AgentError::Api(ApiError::NotPaired))?;
 
         let tally = self.new_tally_client()?;
@@ -716,11 +817,29 @@ impl AgentState {
     }
 
     pub async fn disconnect_company(&self, connection_id: &str) -> Result<(), AgentError> {
+        // Best-effort notify backend to revoke token before deleting local credentials
+        if let Ok(token) = Vault::get_token_for(connection_id) {
+            if let Ok(cloud) = self.new_cloud_client() {
+                let cloud = cloud.with_token(&token);
+                if let Err(e) = cloud.revoke_token(Some(connection_id)).await {
+                    log::warn!(
+                        "Best-effort token revocation failed for connection {}: {}",
+                        connection_id,
+                        e
+                    );
+                }
+            }
+        }
+
         let _ = Vault::delete_token_for(connection_id);
         self.profile_store.delete_for_connection(connection_id)?;
         {
             let mut errors = self.per_company_errors.write().await;
             errors.remove(connection_id);
+        }
+        {
+            let mut backoffs = self.connection_backoffs.write().await;
+            backoffs.remove(connection_id);
         }
         let _ = self.discover_and_merge_companies().await;
         Ok(())
@@ -864,7 +983,12 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
 
                     for profile in &profiles {
                         let cid = &profile.connection_id;
-                        let token = match Vault::get_token_for(cid).or_else(|_| Vault::get_token()) {
+                        if state.should_backoff_connection(cid).await {
+                            log::debug!("[heartbeat] Skipping heartbeat for connection {} due to active rate-limit backoff", cid);
+                            continue;
+                        }
+
+                        let token = match Vault::get_token_for(cid) {
                             Ok(t) => t,
                             Err(_) => continue,
                         };
@@ -895,6 +1019,7 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
 
                         match cloud.heartbeat(&payload).await {
                             Ok(resp) => {
+                                state.record_connection_success(cid).await;
                                 log::debug!(
                                     "[heartbeat] Acknowledged for connection_id='{}' (company='{}', is_active={})",
                                     cid,
@@ -915,7 +1040,8 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
                                 state.handle_token_revoked_for_connection(cid).await;
                             }
                             Err(e) => {
-                                log::debug!("[heartbeat] Transient/non-auth heartbeat error for connection {}: {:?}", cid, e);
+                                let backoff = state.record_connection_failure(cid).await;
+                                log::warn!("[heartbeat] Transient/non-auth heartbeat error for connection {}: {:?}. Backing off for {:?}", cid, e, backoff);
                             }
                         }
                     }
@@ -923,4 +1049,49 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backoff_progression_and_reset() {
+        let mut backoff = ConnectionBackoff::new();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert_eq!(backoff.current_backoff_duration(), Duration::from_secs(0));
+        assert!(backoff.is_allowed());
+
+        // Failure 1: 60s
+        let d1 = backoff.record_failure();
+        assert_eq!(d1, Duration::from_secs(60));
+        assert_eq!(backoff.consecutive_failures, 1);
+        assert!(!backoff.is_allowed());
+
+        // Failure 2: 120s
+        let d2 = backoff.record_failure();
+        assert_eq!(d2, Duration::from_secs(120));
+        assert_eq!(backoff.consecutive_failures, 2);
+
+        // Failure 3: 240s
+        let d3 = backoff.record_failure();
+        assert_eq!(d3, Duration::from_secs(240));
+        assert_eq!(backoff.consecutive_failures, 3);
+
+        // Failure 4: capped at 300s (5 min)
+        let d4 = backoff.record_failure();
+        assert_eq!(d4, Duration::from_secs(300));
+        assert_eq!(backoff.consecutive_failures, 4);
+
+        // Failure 5: stays capped at 300s
+        let d5 = backoff.record_failure();
+        assert_eq!(d5, Duration::from_secs(300));
+        assert_eq!(backoff.consecutive_failures, 5);
+
+        // Success resets immediately
+        backoff.record_success();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert_eq!(backoff.current_backoff_duration(), Duration::from_secs(0));
+        assert!(backoff.is_allowed());
+    }
 }

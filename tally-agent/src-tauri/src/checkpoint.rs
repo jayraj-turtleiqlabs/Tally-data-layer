@@ -191,24 +191,13 @@ impl ProfileStore {
 }
 
 /// Checkpoint per connection storing watermark and sync status.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Checkpoint {
     #[serde(default)]
     pub connection_id: Option<String>,
     pub last_known_alter_id: u64,
     pub last_successful_sync: Option<String>,
     pub backfill_complete: bool,
-}
-
-impl Default for Checkpoint {
-    fn default() -> Self {
-        Self {
-            connection_id: None,
-            last_known_alter_id: 0,
-            last_successful_sync: None,
-            backfill_complete: false,
-        }
-    }
 }
 
 pub struct CheckpointStore {

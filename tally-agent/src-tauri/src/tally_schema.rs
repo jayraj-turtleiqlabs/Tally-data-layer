@@ -219,10 +219,8 @@ fn parse_company_list_common(xml: &str) -> Result<Vec<DiscoveredCompany>, TallyE
                             current_alter_id = Some(id);
                         }
                     }
-                    "GUID" | "COMPANYGUID" => {
-                        if !trimmed.is_empty() {
-                            current_guid = Some(trimmed.to_string());
-                        }
+                    "GUID" | "COMPANYGUID" if !trimmed.is_empty() => {
+                        current_guid = Some(trimmed.to_string());
                     }
                     _ => {}
                 }

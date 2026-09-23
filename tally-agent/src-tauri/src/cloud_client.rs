@@ -1,5 +1,7 @@
 //! One-way HTTPS client — agent only pushes data outward, never reads backend data.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +10,6 @@ use crate::device_auth::{
 };
 use crate::errors::ApiError;
 use crate::redact::redact;
-use crate::vault::Vault;
 
 /// Resolved at runtime via FININSIGHT_API_BASE env var, falling back to compile-time env or production Render base.
 pub fn api_base_url() -> String {
@@ -214,11 +215,28 @@ fn is_explicit_token_revocation(status: reqwest::StatusCode, body: &str) -> bool
         || !body_trimmed.starts_with('{')
 }
 
+fn reqwest_error(e: reqwest::Error) -> ApiError {
+    if e.is_timeout() {
+        ApiError::Network(format!("Request timed out: {}", e))
+    } else {
+        ApiError::Network(e.to_string())
+    }
+}
+
 impl CloudClient {
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
     pub fn new() -> Result<Self, ApiError> {
+        Self::with_timeouts(Self::DEFAULT_TIMEOUT, Self::DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    pub fn with_timeouts(timeout: Duration, connect_timeout: Duration) -> Result<Self, ApiError> {
         let base = api_base_url();
         log::info!("FinInsight Agent using API base: {}", base);
         let http = Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| ApiError::Network(e.to_string()))?;
         Ok(Self {
@@ -239,7 +257,17 @@ impl CloudClient {
     }
 
     pub fn from_base_url(url: &str) -> Result<Self, ApiError> {
+        Self::from_base_url_with_timeouts(url, Self::DEFAULT_TIMEOUT, Self::DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    pub fn from_base_url_with_timeouts(
+        url: &str,
+        timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self, ApiError> {
         let http = Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| ApiError::Network(e.to_string()))?;
         Ok(Self {
@@ -253,6 +281,40 @@ impl CloudClient {
         format!("{}{}", self.base_url, path)
     }
 
+    // ==============================================================================================
+    // DESIGN NOTE: Short-Lived Access Token & Refresh Token Mechanism (Follow-Up Architecture)
+    // ==============================================================================================
+    // Current State:
+    //   The agent currently uses long-lived agent tokens obtained during device authorization/pairing.
+    //   Tokens are stored in the OS credential vault (Vault::store_token_for) and sent via
+    //   `Authorization: Bearer <token>` on all requests (delta sync, heartbeat, revoke).
+    //   If revoked or expired, the backend returns HTTP 401 (ApiError::TokenRevoked), forcing re-pairing.
+    //
+    // Target Architecture:
+    //   Transition to OAuth 2.0 / RFC 6749 short-lived access tokens (e.g. 15-60 min TTL) paired with
+    //   long-lived refresh tokens (with single-use rotation) or mTLS/device binding.
+    //
+    // Requirements for Backend (Unified-Accounting-Gateway):
+    //   1. Endpoint: POST /api/v1/agent/token/refresh
+    //      - Accepts `{ refresh_token: String, connection_id: String }`
+    //      - Returns `{ access_token: String, expires_in: u64, refresh_token: Option<String> }`
+    //      - Enforces single-use refresh token rotation (RTR) to detect token theft.
+    //   2. Response headers / error payloads:
+    //      - Return HTTP 401 with standard `WWW-Authenticate: Bearer error="invalid_token", error_description="token expired"`
+    //        or JSON code `"TOKEN_EXPIRED"` vs `"TOKEN_REVOKED"` so client knows when to refresh vs re-pair.
+    //
+    // Requirements for Agent (tally-agent):
+    //   1. Vault Storage:
+    //      - Store both `access_token` and `refresh_token` per connection (e.g. `Vault::store_tokens_for(...)`).
+    //      - Track access token expiration time locally in memory to proactively refresh before expiry.
+    //   2. CloudClient Token Manager / Middleware:
+    //      - Proactive refresh: if access token has expired (or within a 60s buffer), automatically
+    //        execute refresh call before dispatching the outbound request.
+    //      - Reactive refresh: on HTTP 401 TOKEN_EXPIRED, execute single refresh attempt and retry in-flight request.
+    //        If refresh fails with 401/revoked, fail closed with ApiError::TokenRevoked.
+    //      - Concurrency safety: synchronize refresh calls per connection via tokio::sync::Mutex to prevent
+    //        race conditions between concurrent heartbeat and delta sync calls attempting parallel rotation.
+    // ==============================================================================================
     async fn bearer_token(&self) -> Result<String, ApiError> {
         if let Some(ref t) = self.bearer_token {
             let clean = t.trim();
@@ -260,7 +322,7 @@ impl CloudClient {
                 return Ok(clean.to_string());
             }
         }
-        Vault::get_token().map_err(|_| ApiError::NotPaired)
+        Err(ApiError::NotPaired)
     }
 
     /// POST /api/v1/agent/pair — no auth required.
@@ -277,18 +339,18 @@ impl CloudClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         log::debug!("[cloud_client] Pair response HTTP {}, body: {}", status, redact(&text));
 
         if !status.is_success() {
-            log::warn!("Pairing failed with status {}: {}", status, text);
+            log::warn!("Pairing failed with status {}: {}", status, redact(&text));
             return Err(ApiError::PairingFailed);
         }
 
@@ -311,16 +373,16 @@ impl CloudClient {
             .json(request)
             .send()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         if !status.is_success() {
-            log::warn!("Device initiate failed with status {}: {}", status, text);
+            log::warn!("Device initiate failed with status {}: {}", status, redact(&text));
             return Err(ApiError::InvalidResponse(format!(
                 "Device initiate failed with HTTP {}: {}",
                 status,
@@ -345,16 +407,16 @@ impl CloudClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         if !status.is_success() && status.as_u16() != 400 {
-            log::warn!("Device poll failed with status {}: {}", status, text);
+            log::warn!("Device poll failed with status {}: {}", status, redact(&text));
             return Err(ApiError::InvalidResponse(format!(
                 "Device poll HTTP {}: {}",
                 status,
@@ -370,6 +432,39 @@ impl CloudClient {
         })
     }
 
+    /// POST /api/v1/agent/revoke — best-effort server-side token revocation on disconnect.
+    ///
+    /// NOTE: Endpoint is pending implementation in Unified-Accounting-Gateway. Until available,
+    /// calls will return HTTP 404 which the agent catches and logs at WARN level without blocking local disconnect.
+    pub async fn revoke_token(&self, connection_id: Option<&str>) -> Result<(), ApiError> {
+        let token = self.bearer_token().await?;
+        let mut req = self
+            .http
+            .post(self.url("/api/v1/agent/revoke"))
+            .bearer_auth(&token);
+
+        if let Some(cid) = connection_id {
+            req = req.json(&serde_json::json!({ "connection_id": cid }));
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(reqwest_error)?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            log::warn!(
+                "[cloud_client] Revocation request returned status {}: {}",
+                status,
+                redact(&body)
+            );
+            return Err(ApiError::Network(format!("Revocation failed with status {}", status)));
+        }
+        Ok(())
+    }
+
     /// POST /api/v1/agent/sync/delta — bearer auth, one-way push for initial batches.
     pub async fn push_initial_batch(&self, batch: &SyncBatchPayload) -> Result<(), ApiError> {
         let token = self.bearer_token().await?;
@@ -381,7 +476,7 @@ impl CloudClient {
             .json(batch)
             .send()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         let status = resp.status();
         log::debug!(
@@ -423,7 +518,7 @@ impl CloudClient {
             .json(payload)
             .send()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         let status = resp.status();
         log::debug!(
@@ -464,7 +559,7 @@ impl CloudClient {
             .json(payload)
             .send()
             .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(reqwest_error)?;
 
         let status = resp.status();
         log::debug!(
@@ -506,10 +601,177 @@ impl Default for CloudClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn api_base_is_non_empty() {
         let base = api_base_url();
         assert!(!base.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bearer_token_returns_not_paired_when_unset_even_if_legacy_token_exists() {
+        crate::vault::Vault::store_token("legacy-test-token-never-fallback").ok();
+
+        let client = CloudClient::from_base_url("http://127.0.0.1:18888").unwrap();
+        let res = client.bearer_token().await;
+        assert!(
+            matches!(res, Err(ApiError::NotPaired)),
+            "Must return NotPaired when bearer_token is not set on client, ignoring legacy Vault token"
+        );
+
+        let _ = crate::vault::Vault::delete_token();
+    }
+
+    #[tokio::test]
+    async fn default_timeouts_are_configured() {
+        assert_eq!(CloudClient::DEFAULT_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(CloudClient::DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn request_times_out_within_bounded_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/pair"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url_with_timeouts(
+            &server.uri(),
+            Duration::from_millis(150),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let result = client.pair("ABCDEF", "Company").await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "Expected timeout error on delayed response, got {:?}",
+            result
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "Request must time out within bounded time (took {:?})",
+            elapsed
+        );
+        match result.unwrap_err() {
+            ApiError::Network(msg) => {
+                assert!(
+                    msg.to_ascii_lowercase().contains("timeout")
+                        || msg.to_ascii_lowercase().contains("timed out"),
+                    "Network error should indicate timeout: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ApiError::Network, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_body_in_error_logs_is_redacted() {
+        let server = MockServer::start().await;
+        let sensitive_token = "agent-tok-supersecret1234567890abcdef";
+        let sensitive_gstin = "27AABCU9603R1ZM";
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/pair"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(format!(
+                r#"{{"error": "failure with token {} and gstin {}"}}"#,
+                sensitive_token, sensitive_gstin
+            )))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/device/initiate"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(format!(
+                r#"{{"error": "initiate failed with token {}"}}"#,
+                sensitive_token
+            )))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/device/poll"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(format!(
+                r#"{{"error": "poll failed with token {}"}}"#,
+                sensitive_token
+            )))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri()).unwrap();
+
+        // 1. Pair
+        let pair_err = client.pair("ABCDEF", "Company").await.unwrap_err();
+        assert!(matches!(pair_err, ApiError::PairingFailed));
+
+        // 2. Initiate device
+        let init_req = DeviceInitiateRequest {
+            company_name: Some("Test Company".into()),
+            ..Default::default()
+        };
+        let init_err = client.initiate_device(&init_req).await.unwrap_err();
+        if let ApiError::InvalidResponse(msg) = init_err {
+            assert!(
+                !msg.contains(sensitive_token),
+                "Error message must redact token: {}",
+                msg
+            );
+            assert!(
+                msg.contains("[REDACTED"),
+                "Error message must contain redacted indicator: {}",
+                msg
+            );
+        } else {
+            panic!("Expected InvalidResponse, got {:?}", init_err);
+        }
+
+        // 3. Poll device
+        let poll_err = client.poll_device("dev-code-123").await.unwrap_err();
+        if let ApiError::InvalidResponse(msg) = poll_err {
+            assert!(
+                !msg.contains(sensitive_token),
+                "Error message must redact token: {}",
+                msg
+            );
+            assert!(
+                msg.contains("[REDACTED"),
+                "Error message must contain redacted indicator: {}",
+                msg
+            );
+        } else {
+            panic!("Expected InvalidResponse, got {:?}", poll_err);
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_token_sends_bearer_and_connection_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/revoke"))
+            .and(header("authorization", "Bearer test-revoke-bearer-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri())
+            .unwrap()
+            .with_token("test-revoke-bearer-token");
+
+        let res = client.revoke_token(Some("conn-test-revoke-1")).await;
+        assert!(res.is_ok(), "revoke_token must succeed on 200 OK");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["connection_id"], "conn-test-revoke-1");
     }
 }
