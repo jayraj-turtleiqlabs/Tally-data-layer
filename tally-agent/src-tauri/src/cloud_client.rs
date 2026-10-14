@@ -75,6 +75,9 @@ pub struct CloudClient {
     http: Client,
     base_url: String,
     bearer_token: Option<String>,
+    pub sync_timeout: Duration,
+    pub sync_retries: u32,
+    pub sync_initial_backoff: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -156,6 +159,9 @@ fn reqwest_error(e: reqwest::Error) -> ApiError {
 impl CloudClient {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
     pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+    pub const MAX_SYNC_RETRIES: u32 = 2;
+    pub const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
     pub fn new() -> Result<Self, ApiError> {
         Self::with_timeouts(Self::DEFAULT_TIMEOUT, Self::DEFAULT_CONNECT_TIMEOUT)
@@ -173,6 +179,9 @@ impl CloudClient {
             http,
             base_url: base.trim_end_matches('/').to_string(),
             bearer_token: None,
+            sync_timeout: Self::SYNC_TIMEOUT,
+            sync_retries: Self::MAX_SYNC_RETRIES,
+            sync_initial_backoff: Self::INITIAL_RETRY_BACKOFF,
         })
     }
 
@@ -183,6 +192,17 @@ impl CloudClient {
 
     pub fn with_token(mut self, token: &str) -> Self {
         self.bearer_token = Some(token.to_string());
+        self
+    }
+
+    pub fn with_sync_timeout(mut self, timeout: Duration) -> Self {
+        self.sync_timeout = timeout;
+        self
+    }
+
+    pub fn with_sync_retry_config(mut self, retries: u32, initial_backoff: Duration) -> Self {
+        self.sync_retries = retries;
+        self.sync_initial_backoff = initial_backoff;
         self
     }
 
@@ -204,6 +224,9 @@ impl CloudClient {
             http,
             base_url: url.trim_end_matches('/').to_string(),
             bearer_token: None,
+            sync_timeout: Self::SYNC_TIMEOUT,
+            sync_retries: Self::MAX_SYNC_RETRIES,
+            sync_initial_backoff: Self::INITIAL_RETRY_BACKOFF,
         })
     }
 
@@ -374,27 +397,90 @@ impl CloudClient {
         }
     }
 
-    /// POST /api/v1/agent/sync/delta — bearer auth, one-way push for initial batches.
-    pub async fn push_initial_batch(&self, batch: &SyncBatchPayload) -> Result<(), ApiError> {
+    async fn send_sync_delta<T: Serialize>(
+        &self,
+        payload: &T,
+        log_context: &str,
+    ) -> Result<(reqwest::StatusCode, String), ApiError> {
         let token = self.bearer_token().await?;
-        let has_token = !token.is_empty();
-        let resp = self
-            .http
-            .post(self.url("/api/v1/agent/sync/delta"))
-            .bearer_auth(&token)
-            .json(batch)
-            .send()
-            .await
-            .map_err(reqwest_error)?;
+        let mut attempt = 0;
+        let mut backoff = self.sync_initial_backoff;
 
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        loop {
+            attempt += 1;
+            let req = self
+                .http
+                .post(self.url("/api/v1/agent/sync/delta"))
+                .bearer_auth(&token)
+                .timeout(self.sync_timeout)
+                .json(payload);
+
+            let res = req.send().await;
+            match res {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(body) => return Ok((status, body)),
+                        Err(e) if e.is_timeout() => {
+                            if attempt <= self.sync_retries {
+                                log::warn!(
+                                    "[cloud_client] Reading response for {} timed out after {:?} (attempt {}/{}). Retrying in {:?} (gateway is slow)...",
+                                    log_context,
+                                    self.sync_timeout,
+                                    attempt,
+                                    self.sync_retries + 1,
+                                    backoff
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = backoff.saturating_mul(2);
+                                continue;
+                            } else {
+                                log::error!(
+                                    "[cloud_client] Reading response for {} timed out after {} attempts: gateway is slow",
+                                    log_context,
+                                    attempt
+                                );
+                                return Err(ApiError::GatewayTimeout);
+                            }
+                        }
+                        Err(e) => return Err(reqwest_error(e)),
+                    }
+                }
+                Err(e) if e.is_timeout() => {
+                    if attempt <= self.sync_retries {
+                        log::warn!(
+                            "[cloud_client] {} timed out after {:?} (attempt {}/{}). Retrying in {:?} (gateway is slow)...",
+                            log_context,
+                            self.sync_timeout,
+                            attempt,
+                            self.sync_retries + 1,
+                            backoff
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2);
+                    } else {
+                        log::error!(
+                            "[cloud_client] {} timed out after {} attempts: gateway is slow",
+                            log_context,
+                            attempt
+                        );
+                        return Err(ApiError::GatewayTimeout);
+                    }
+                }
+                Err(e) => return Err(reqwest_error(e)),
+            }
+        }
+    }
+
+    /// POST /api/v1/agent/sync/delta — bearer auth, one-way push for initial batches.
+    /// Uses 120s timeout and retries timed-out batches with backoff.
+    pub async fn push_initial_batch(&self, batch: &SyncBatchPayload) -> Result<(), ApiError> {
+        let log_ctx = format!("initial batch {}/{}", batch.batch_index + 1, batch.total_batches);
+        let (status, body) = self.send_sync_delta(batch, &log_ctx).await?;
         log::debug!(
-            "[cloud_client] POST /api/v1/agent/sync/delta (initial batch {}/{}) -> HTTP {} (token_present: {})",
-            batch.batch_index + 1,
-            batch.total_batches,
-            status,
-            has_token
+            "[cloud_client] POST /api/v1/agent/sync/delta ({}) -> HTTP {}",
+            log_ctx,
+            status
         );
 
         if !status.is_success() {
@@ -418,25 +504,14 @@ impl CloudClient {
     }
 
     /// POST /api/v1/agent/sync/delta — bearer auth, one-way push.
+    /// Uses 120s timeout and retries timed-out batches with backoff.
     pub async fn push_delta(&self, payload: &DeltaSyncPayload) -> Result<(), ApiError> {
-        let token = self.bearer_token().await?;
-        let has_token = !token.is_empty();
-        let resp = self
-            .http
-            .post(self.url("/api/v1/agent/sync/delta"))
-            .bearer_auth(&token)
-            .json(payload)
-            .send()
-            .await
-            .map_err(reqwest_error)?;
-
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let log_ctx = format!("delta sync ({} records)", payload.records.len());
+        let (status, body) = self.send_sync_delta(payload, &log_ctx).await?;
         log::debug!(
-            "[cloud_client] POST /api/v1/agent/sync/delta (records: {}) -> HTTP {} (token_present: {})",
-            payload.records.len(),
-            status,
-            has_token
+            "[cloud_client] POST /api/v1/agent/sync/delta ({}) -> HTTP {}",
+            log_ctx,
+            status
         );
 
         if !status.is_success() {
@@ -539,6 +614,76 @@ mod tests {
     async fn default_timeouts_are_configured() {
         assert_eq!(CloudClient::DEFAULT_TIMEOUT, Duration::from_secs(30));
         assert_eq!(CloudClient::DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(CloudClient::SYNC_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(CloudClient::MAX_SYNC_RETRIES, 2);
+    }
+
+    #[tokio::test]
+    async fn sync_push_times_out_and_retries_with_gateway_slow_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/sync/delta"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+            .expect(3) // 1 initial + 2 retries
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri())
+            .unwrap()
+            .with_token("test-tok")
+            .with_sync_timeout(Duration::from_millis(100))
+            .with_sync_retry_config(2, Duration::from_millis(10));
+
+        let payload = DeltaSyncPayload {
+            company_name: Some("Test".into()),
+            records: vec![],
+            alter_id_high: 10,
+            new_alter_id: "10".into(),
+        };
+
+        let result = client.push_delta(&payload).await;
+        assert!(matches!(result, Err(ApiError::GatewayTimeout)));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Gateway is slow to respond (request timed out). Please try again."
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_push_succeeds_after_timeout_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/sync/delta"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/sync/delta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "alterId": 10,
+                "recordsProcessed": 0
+            })))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri())
+            .unwrap()
+            .with_token("test-tok")
+            .with_sync_timeout(Duration::from_millis(100))
+            .with_sync_retry_config(2, Duration::from_millis(10));
+
+        let payload = DeltaSyncPayload {
+            company_name: Some("Test".into()),
+            records: vec![],
+            alter_id_high: 10,
+            new_alter_id: "10".into(),
+        };
+
+        let result = client.push_delta(&payload).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

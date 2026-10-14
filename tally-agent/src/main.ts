@@ -161,6 +161,9 @@ function renderCompanies(companies: CompanyItem[]) {
           <button class="btn primary sync-company-btn" data-cid="${company.connection_id}" ${!isOnlineActive || isSyncing ? "disabled" : ""} title="${!isOnlineActive ? `Open ${escapeHtml(company.company_name)} in Tally to sync` : ""}">
             ${isSyncing ? "Syncing…" : "Sync Now"}
           </button>
+          <button class="btn secondary full-resync-company-btn" data-cid="${company.connection_id}" data-name="${escapeHtml(company.company_name)}" ${!isOnlineActive || isSyncing ? "disabled" : ""} title="Reset checkpoint and re-sync all records from beginning">
+            Full Resync
+          </button>
           <button class="btn secondary disconnect-company-btn" data-cid="${company.connection_id}" data-name="${escapeHtml(company.company_name)}">
             Disconnect
           </button>
@@ -218,6 +221,31 @@ function attachCardEvents() {
         await invoke("sync_company", { connectionId: cid });
       } catch (err) {
         console.error("Sync failed:", err);
+        showToast(String(err));
+      } finally {
+        await loadCompaniesCached();
+      }
+    });
+  });
+
+  // Full resync buttons
+  document.querySelectorAll(".full-resync-company-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const target = e.currentTarget as HTMLButtonElement;
+      const cid = target.getAttribute("data-cid");
+      const name = target.getAttribute("data-name") || "this company";
+      if (!cid) return;
+
+      if (!confirm(`Force a full re-sync for ${name}? This will reset the checkpoint to 0 and re-push all records.`)) return;
+
+      target.disabled = true;
+      target.textContent = "Resyncing…";
+
+      try {
+        await invoke("full_resync_company", { connectionId: cid });
+      } catch (err) {
+        console.error("Full resync failed:", err);
+        showToast(String(err));
       } finally {
         await loadCompaniesCached();
       }

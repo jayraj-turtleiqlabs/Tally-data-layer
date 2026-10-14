@@ -845,6 +845,24 @@ impl AgentState {
         Ok(())
     }
 
+    /// Reset checkpoint for a connection to force a full re-sync without disconnecting.
+    pub async fn reset_checkpoint_for_connection(&self, connection_id: &str) -> Result<(), AgentError> {
+        let conn_checkpoint_store = self.checkpoint_store_for_connection(connection_id);
+        conn_checkpoint_store.reset_for_full_resync()?;
+        log::info!(
+            "[sync] Checkpoint reset for connection_id='{}' (last_known_alter_id=0, backfill_complete=false)",
+            connection_id
+        );
+        let _ = self.discover_and_merge_companies().await;
+        Ok(())
+    }
+
+    /// Performs a full re-sync for a connection by resetting checkpoint and triggering initial backfill.
+    pub async fn full_resync_company(&self, connection_id: &str) -> Result<SyncResult, AgentError> {
+        self.reset_checkpoint_for_connection(connection_id).await?;
+        self.sync_company(connection_id).await
+    }
+
 
     pub async fn start_device_login(&self) -> Result<DeviceAuthPublicSession, AgentError> {
         let tally = self.new_tally_client()?;

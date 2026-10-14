@@ -71,6 +71,27 @@ async fn sync_company(
 }
 
 #[tauri::command]
+async fn reset_checkpoint(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    state.reset_checkpoint_for_connection(&connection_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn full_resync_company(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    let result = state.full_resync_company(&connection_id).await.map_err(|e| e.to_string())?;
+    if result.success {
+        Ok(())
+    } else {
+        Err(result.error_message.unwrap_or_else(|| "Full resync failed.".into()))
+    }
+}
+
+#[tauri::command]
 async fn disconnect_company(
     connection_id: String,
     state: tauri::State<'_, Arc<AgentState>>,
@@ -194,6 +215,8 @@ fn main() {
             initiate_company_connection,
             poll_company_connection,
             sync_company,
+            reset_checkpoint,
+            full_resync_company,
             disconnect_company,
             get_agent_status,
             initiate_device_login,

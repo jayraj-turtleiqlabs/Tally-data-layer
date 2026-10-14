@@ -63,12 +63,21 @@ npm run dev
 See [`tally-agent/README.md`]
 (tally-agent/README.md) for the agent implementation sequence and test plan.
 
+### Build for local development
+
+```powershell
+# From workspace root or inside tally-agent:
+cd tally-agent
+$env:FININSIGHT_API_BASE = "https://fin.turtleiqlabs.com"
+npm run tauri dev
+```
+
 ### Build Standalone Production EXE
 
 ```powershell
 # From workspace root or inside tally-agent:
 cd tally-agent
-$env:FININSIGHT_API_BASE = "https://fininsight-api-vzv5.onrender.com"
+$env:FININSIGHT_API_BASE = "https://fin.turtleiqlabs.com"
 npm run build:exe
 ```
 
