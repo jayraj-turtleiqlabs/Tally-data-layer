@@ -24,88 +24,16 @@ pub fn api_base_url() -> String {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct PairRequest {
-    pub code: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[allow(non_snake_case)]
-pub struct PairResponse {
-    pub token: Option<String>,
-    pub agent_token: Option<String>,
-    pub agentToken: Option<String>,
-    pub connection_id: Option<String>,
-    pub connectionId: Option<String>,
-    pub organization_id: Option<String>,
-    pub organizationId: Option<String>,
-    pub company_name: Option<String>,
-    pub companyName: Option<String>,
-    pub data: Option<serde_json::Value>,
-}
-
-impl PairResponse {
-    pub fn token(&self) -> Result<String, ApiError> {
-        if let Some(ref t) = self.token {
-            if !t.is_empty() {
-                return Ok(t.clone());
-            }
-        }
-        if let Some(ref t) = self.agent_token {
-            if !t.is_empty() {
-                return Ok(t.clone());
-            }
-        }
-        if let Some(ref t) = self.agentToken {
-            if !t.is_empty() {
-                return Ok(t.clone());
-            }
-        }
-        if let Some(ref d) = self.data {
-            if let Some(t) = d.get("token").or_else(|| d.get("agent_token")).or_else(|| d.get("agentToken")) {
-                if let Some(s) = t.as_str() {
-                    if !s.is_empty() {
-                        return Ok(s.to_string());
-                    }
-                }
-            }
-        }
-        Err(ApiError::InvalidResponse("No token field in pairing response".to_string()))
-    }
-
-    pub fn connection_id(&self) -> Option<String> {
-        self.connection_id
-            .clone()
-            .or_else(|| self.connectionId.clone())
-            .or_else(|| {
-                self.data.as_ref().and_then(|d| {
-                    d.get("connection_id")
-                        .or_else(|| d.get("connectionId"))
-                        .and_then(|v| v.as_str().map(String::from))
-                })
-            })
-    }
-
-    pub fn company_name(&self) -> Option<String> {
-        self.company_name
-            .clone()
-            .or_else(|| self.companyName.clone())
-            .or_else(|| {
-                self.data.as_ref().and_then(|d| {
-                    d.get("company_name")
-                        .or_else(|| d.get("companyName"))
-                        .and_then(|v| v.as_str().map(String::from))
-                })
-            })
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct SyncBatchPayload {
+    #[serde(rename = "companyName", skip_serializing_if = "Option::is_none")]
+    pub company_name: Option<String>,
     pub batch_index: u32,
     pub total_batches: u32,
     pub entity_type: String,
     pub records: Vec<serde_json::Value>,
     pub alter_id_high: u64,
+    #[serde(rename = "newAlterId")]
+    pub new_alter_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,8 +44,12 @@ pub struct InitialSyncPayload {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeltaSyncPayload {
+    #[serde(rename = "companyName", skip_serializing_if = "Option::is_none")]
+    pub company_name: Option<String>,
     pub records: Vec<serde_json::Value>,
     pub alter_id_high: u64,
+    #[serde(rename = "newAlterId")]
+    pub new_alter_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +57,9 @@ pub struct HeartbeatPayload {
     pub tally_reachable: bool,
     pub agent_version: String,
     pub last_known_alter_id: u64,
+    pub timestamp: String,
+    #[serde(rename = "lastSuccessfulSyncAt", skip_serializing_if = "Option::is_none")]
+    pub last_successful_sync_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -282,38 +217,16 @@ impl CloudClient {
     }
 
     // ==============================================================================================
-    // DESIGN NOTE: Short-Lived Access Token & Refresh Token Mechanism (Follow-Up Architecture)
+    // DESIGN NOTE: 90-Day Sliding Agent Token Model
     // ==============================================================================================
-    // Current State:
-    //   The agent currently uses long-lived agent tokens obtained during device authorization/pairing.
+    // Current Architecture:
+    //   Agent tokens are long-lived with a sliding 90-day expiry extended automatically on each heartbeat.
     //   Tokens are stored in the OS credential vault (Vault::store_token_for) and sent via
-    //   `Authorization: Bearer <token>` on all requests (delta sync, heartbeat, revoke).
-    //   If revoked or expired, the backend returns HTTP 401 (ApiError::TokenRevoked), forcing re-pairing.
+    //   `Authorization: Bearer <token>` on all outbound agent requests (delta sync, heartbeat, revoke).
     //
-    // Target Architecture:
-    //   Transition to OAuth 2.0 / RFC 6749 short-lived access tokens (e.g. 15-60 min TTL) paired with
-    //   long-lived refresh tokens (with single-use rotation) or mTLS/device binding.
-    //
-    // Requirements for Backend (Unified-Accounting-Gateway):
-    //   1. Endpoint: POST /api/v1/agent/token/refresh
-    //      - Accepts `{ refresh_token: String, connection_id: String }`
-    //      - Returns `{ access_token: String, expires_in: u64, refresh_token: Option<String> }`
-    //      - Enforces single-use refresh token rotation (RTR) to detect token theft.
-    //   2. Response headers / error payloads:
-    //      - Return HTTP 401 with standard `WWW-Authenticate: Bearer error="invalid_token", error_description="token expired"`
-    //        or JSON code `"TOKEN_EXPIRED"` vs `"TOKEN_REVOKED"` so client knows when to refresh vs re-pair.
-    //
-    // Requirements for Agent (tally-agent):
-    //   1. Vault Storage:
-    //      - Store both `access_token` and `refresh_token` per connection (e.g. `Vault::store_tokens_for(...)`).
-    //      - Track access token expiration time locally in memory to proactively refresh before expiry.
-    //   2. CloudClient Token Manager / Middleware:
-    //      - Proactive refresh: if access token has expired (or within a 60s buffer), automatically
-    //        execute refresh call before dispatching the outbound request.
-    //      - Reactive refresh: on HTTP 401 TOKEN_EXPIRED, execute single refresh attempt and retry in-flight request.
-    //        If refresh fails with 401/revoked, fail closed with ApiError::TokenRevoked.
-    //      - Concurrency safety: synchronize refresh calls per connection via tokio::sync::Mutex to prevent
-    //        race conditions between concurrent heartbeat and delta sync calls attempting parallel rotation.
+    //   There is no separate refresh token endpoint (/agent/token/refresh) and no TOKEN_EXPIRED code.
+    //   If an agent remains offline for more than 90 days, or if the connection is revoked,
+    //   the gateway returns HTTP 401, forcing the agent to re-pair via the RFC 8628 device authorization flow.
     // ==============================================================================================
     async fn bearer_token(&self) -> Result<String, ApiError> {
         if let Some(ref t) = self.bearer_token {
@@ -323,41 +236,6 @@ impl CloudClient {
             }
         }
         Err(ApiError::NotPaired)
-    }
-
-    /// POST /api/v1/agent/pair — no auth required.
-    pub async fn pair(&self, code: &str, _tally_company: &str) -> Result<PairResponse, ApiError> {
-        let body = PairRequest {
-            code: code.to_uppercase(),
-        };
-
-        log::info!("Pairing attempt initiated");
-
-        let resp = self
-            .http
-            .post(self.url("/api/v1/agent/pair"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(reqwest_error)?;
-
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(reqwest_error)?;
-
-        log::debug!("[cloud_client] Pair response HTTP {}, body: {}", status, redact(&text));
-
-        if !status.is_success() {
-            log::warn!("Pairing failed with status {}: {}", status, redact(&text));
-            return Err(ApiError::PairingFailed);
-        }
-
-        serde_json::from_str::<PairResponse>(&text).map_err(|e| {
-            log::error!("[cloud_client] Deserialization error: {} for text: {}", e, redact(&text));
-            ApiError::InvalidResponse(redact(&e.to_string()))
-        })
     }
 
     /// POST /api/v1/agent/device/initiate — requests device authorization codes.
@@ -434,8 +312,8 @@ impl CloudClient {
 
     /// POST /api/v1/agent/revoke — best-effort server-side token revocation on disconnect.
     ///
-    /// NOTE: Endpoint is pending implementation in Unified-Accounting-Gateway. Until available,
-    /// calls will return HTTP 404 which the agent catches and logs at WARN level without blocking local disconnect.
+    /// The gateway returns HTTP 200 (idempotent), HTTP 403 if connection_id mismatches,
+    /// or HTTP 429 when rate limited.
     pub async fn revoke_token(&self, connection_id: Option<&str>) -> Result<(), ApiError> {
         let token = self.bearer_token().await?;
         let mut req = self
@@ -465,6 +343,42 @@ impl CloudClient {
         Ok(())
     }
 
+    /// Helper to validate 2xx response body from sync push.
+    /// If `success == false`, returns `Err(ApiError::SyncFailed(status))`.
+    /// If body is empty or unparseable JSON on 2xx, treats as success and logs at WARN.
+    fn check_sync_response_body(status: reqwest::StatusCode, body: &str) -> Result<(), ApiError> {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            log::warn!(
+                "[cloud_client] Empty response body on HTTP {} sync push; treating as success",
+                status
+            );
+            return Ok(());
+        }
+
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(json_val) => {
+                if let Some(false) = json_val.get("success").and_then(|v| v.as_bool()) {
+                    log::warn!(
+                        "[cloud_client] Sync push response indicated failure (success=false): {}",
+                        redact(trimmed)
+                    );
+                    return Err(ApiError::SyncFailed(status.as_u16()));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!(
+                    "[cloud_client] Unparseable response body on HTTP {} sync push ({}); treating as success: {}",
+                    status,
+                    e,
+                    redact(trimmed)
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// POST /api/v1/agent/sync/delta — bearer auth, one-way push for initial batches.
     pub async fn push_initial_batch(&self, batch: &SyncBatchPayload) -> Result<(), ApiError> {
         let token = self.bearer_token().await?;
@@ -479,6 +393,7 @@ impl CloudClient {
             .map_err(reqwest_error)?;
 
         let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
         log::debug!(
             "[cloud_client] POST /api/v1/agent/sync/delta (initial batch {}/{}) -> HTTP {} (token_present: {})",
             batch.batch_index + 1,
@@ -488,7 +403,6 @@ impl CloudClient {
         );
 
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             if is_explicit_token_revocation(status, &body) {
                 log::warn!(
                     "[cloud_client] Initial batch push returned HTTP {} with confirmed token revocation (body: {})",
@@ -504,7 +418,8 @@ impl CloudClient {
             );
             return Err(ApiError::SyncFailed(status.as_u16()));
         }
-        Ok(())
+
+        Self::check_sync_response_body(status, &body)
     }
 
     /// POST /api/v1/agent/sync/delta — bearer auth, one-way push.
@@ -521,6 +436,7 @@ impl CloudClient {
             .map_err(reqwest_error)?;
 
         let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
         log::debug!(
             "[cloud_client] POST /api/v1/agent/sync/delta (records: {}) -> HTTP {} (token_present: {})",
             payload.records.len(),
@@ -529,7 +445,6 @@ impl CloudClient {
         );
 
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             if is_explicit_token_revocation(status, &body) {
                 log::warn!(
                     "[cloud_client] Delta sync push returned HTTP {} with confirmed token revocation (body: {})",
@@ -545,7 +460,8 @@ impl CloudClient {
             );
             return Err(ApiError::SyncFailed(status.as_u16()));
         }
-        Ok(())
+
+        Self::check_sync_response_body(status, &body)
     }
 
     /// POST /api/v1/agent/heartbeat — reports liveness only, may return sync_requested flag.
@@ -634,7 +550,7 @@ mod tests {
     async fn request_times_out_within_bounded_time() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/v1/agent/pair"))
+            .and(path("/api/v1/agent/device/poll"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
             .mount(&server)
             .await;
@@ -647,7 +563,7 @@ mod tests {
         .unwrap();
 
         let start = std::time::Instant::now();
-        let result = client.pair("ABCDEF", "Company").await;
+        let result = client.poll_device("dev-code").await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -677,16 +593,6 @@ mod tests {
     async fn response_body_in_error_logs_is_redacted() {
         let server = MockServer::start().await;
         let sensitive_token = "agent-tok-supersecret1234567890abcdef";
-        let sensitive_gstin = "27AABCU9603R1ZM";
-
-        Mock::given(method("POST"))
-            .and(path("/api/v1/agent/pair"))
-            .respond_with(ResponseTemplate::new(500).set_body_string(format!(
-                r#"{{"error": "failure with token {} and gstin {}"}}"#,
-                sensitive_token, sensitive_gstin
-            )))
-            .mount(&server)
-            .await;
 
         Mock::given(method("POST"))
             .and(path("/api/v1/agent/device/initiate"))
@@ -708,11 +614,7 @@ mod tests {
 
         let client = CloudClient::from_base_url(&server.uri()).unwrap();
 
-        // 1. Pair
-        let pair_err = client.pair("ABCDEF", "Company").await.unwrap_err();
-        assert!(matches!(pair_err, ApiError::PairingFailed));
-
-        // 2. Initiate device
+        // 1. Initiate device
         let init_req = DeviceInitiateRequest {
             company_name: Some("Test Company".into()),
             ..Default::default()
@@ -733,7 +635,7 @@ mod tests {
             panic!("Expected InvalidResponse, got {:?}", init_err);
         }
 
-        // 3. Poll device
+        // 2. Poll device
         let poll_err = client.poll_device("dev-code-123").await.unwrap_err();
         if let ApiError::InvalidResponse(msg) = poll_err {
             assert!(
@@ -773,5 +675,164 @@ mod tests {
         let req = &requests[0];
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(body["connection_id"], "conn-test-revoke-1");
+    }
+
+    #[tokio::test]
+    async fn sync_push_200_success_true_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/sync/delta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "alterId": 1234,
+                "recordsProcessed": 5
+            })))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri())
+            .unwrap()
+            .with_token("test-agent-token");
+
+        let payload = DeltaSyncPayload {
+            company_name: Some("Acme Corp".into()),
+            records: vec![],
+            alter_id_high: 1234,
+            new_alter_id: "1234".into(),
+        };
+
+        let res = client.push_delta(&payload).await;
+        assert!(res.is_ok(), "push_delta must succeed on 200 {{\"success\":true}}");
+    }
+
+    #[tokio::test]
+    async fn sync_push_200_success_false_returns_sync_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/sync/delta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": "Batch validation failed"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri())
+            .unwrap()
+            .with_token("test-agent-token");
+
+        let payload = DeltaSyncPayload {
+            company_name: Some("Acme Corp".into()),
+            records: vec![],
+            alter_id_high: 1234,
+            new_alter_id: "1234".into(),
+        };
+
+        let err = client.push_delta(&payload).await.unwrap_err();
+        match err {
+            ApiError::SyncFailed(code) => assert_eq!(code, 200),
+            other => panic!("Expected ApiError::SyncFailed(200), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_push_200_empty_body_treated_as_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/sync/delta"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri())
+            .unwrap()
+            .with_token("test-agent-token");
+
+        let payload = DeltaSyncPayload {
+            company_name: Some("Acme Corp".into()),
+            records: vec![],
+            alter_id_high: 1234,
+            new_alter_id: "1234".into(),
+        };
+
+        let res = client.push_delta(&payload).await;
+        assert!(res.is_ok(), "push_delta must treat 200 empty body as success");
+    }
+
+    #[tokio::test]
+    async fn sync_push_422_failure_returns_sync_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/sync/delta"))
+            .respond_with(ResponseTemplate::new(422).set_body_string(r#"{"error":"Unprocessable Entity"}"#))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri())
+            .unwrap()
+            .with_token("test-agent-token");
+
+        let payload = DeltaSyncPayload {
+            company_name: Some("Acme Corp".into()),
+            records: vec![],
+            alter_id_high: 1234,
+            new_alter_id: "1234".into(),
+        };
+
+        let err = client.push_delta(&payload).await.unwrap_err();
+        match err {
+            ApiError::SyncFailed(code) => assert_eq!(code, 422),
+            other => panic!("Expected ApiError::SyncFailed(422), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sync_payloads_serialize_company_name_and_new_alter_id() {
+        let delta_payload = DeltaSyncPayload {
+            company_name: Some("Acme Corp".into()),
+            records: vec![],
+            alter_id_high: 42,
+            new_alter_id: "42".into(),
+        };
+        let delta_val = serde_json::to_value(&delta_payload).unwrap();
+        assert_eq!(delta_val["companyName"], "Acme Corp");
+        assert_eq!(delta_val["newAlterId"], "42");
+        assert_eq!(delta_val["alter_id_high"], 42);
+
+        // Omit companyName if None
+        let delta_payload_none = DeltaSyncPayload {
+            company_name: None,
+            records: vec![],
+            alter_id_high: 42,
+            new_alter_id: "42".into(),
+        };
+        let delta_val_none = serde_json::to_value(&delta_payload_none).unwrap();
+        assert!(delta_val_none.get("companyName").is_none());
+        assert_eq!(delta_val_none["newAlterId"], "42");
+
+        let batch_payload = SyncBatchPayload {
+            company_name: Some("Acme Corp".into()),
+            batch_index: 0,
+            total_batches: 1,
+            entity_type: "ledger".into(),
+            records: vec![],
+            alter_id_high: 100,
+            new_alter_id: "100".into(),
+        };
+        let batch_val = serde_json::to_value(&batch_payload).unwrap();
+        assert_eq!(batch_val["companyName"], "Acme Corp");
+        assert_eq!(batch_val["newAlterId"], "100");
+        assert_eq!(batch_val["alter_id_high"], 100);
+
+        let hb = HeartbeatPayload {
+            tally_reachable: true,
+            agent_version: "1.0.0".into(),
+            last_known_alter_id: 100,
+            timestamp: "2026-10-13T10:00:00Z".into(),
+            last_successful_sync_at: Some("2026-10-13T09:00:00Z".into()),
+        };
+        let hb_val = serde_json::to_value(&hb).unwrap();
+        assert_eq!(hb_val["timestamp"], "2026-10-13T10:00:00Z");
+        assert_eq!(hb_val["lastSuccessfulSyncAt"], "2026-10-13T09:00:00Z");
     }
 }

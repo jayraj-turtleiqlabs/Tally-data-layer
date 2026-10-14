@@ -45,8 +45,10 @@ async fn backend_non_200_leaves_checkpoint_unchanged() {
         .unwrap()
         .with_token("test-token-for-mock");
     let payload = DeltaSyncPayload {
+        company_name: Some("Acme Corp".into()),
         records: vec![serde_json::json!({"alter_id": 200})],
         alter_id_high: 200,
+        new_alter_id: "200".into(),
     };
 
     let result = client.push_delta(&payload).await;
@@ -54,6 +56,43 @@ async fn backend_non_200_leaves_checkpoint_unchanged() {
 
     let cp_after = store.load().unwrap();
     assert_eq!(cp_before.last_known_alter_id, cp_after.last_known_alter_id);
+}
+
+#[tokio::test]
+async fn test_checkpoint_does_not_advance_on_200_success_false() {
+    let server = MockServer::start().await;
+
+    // Gateway responds 200 with success: false (batch rejected / un-updated gateway pattern)
+    Mock::given(method("POST"))
+        .and(path("/api/v1/agent/sync/delta"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "error": "Batch validation error"
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = CheckpointStore::new(dir.path().join("cp.json"));
+
+    let client = CloudClient::from_base_url(&server.uri())
+        .unwrap()
+        .with_token("test-token");
+
+    let payload = DeltaSyncPayload {
+        company_name: Some("Acme Corp".into()),
+        records: vec![],
+        alter_id_high: 500,
+        new_alter_id: "500".into(),
+    };
+
+    let push_result = client.push_delta(&payload).await;
+    assert!(push_result.is_err(), "push_delta must fail on 200 {{success: false}}");
+
+    // Verify checkpoint store was NOT advanced
+    let cp = store.load().unwrap();
+    assert_eq!(cp.last_known_alter_id, 0);
+    assert!(!cp.backfill_complete);
 }
 
 #[test]
@@ -264,6 +303,7 @@ async fn test_device_auth_approved_stores_token_via_shared_path() {
 async fn test_device_auth_denied_stops_polling_and_no_token() {
     let _guard = VAULT_TEST_LOCK.lock().await;
     let _ = Vault::delete_token();
+    let _ = Vault::delete_token_for("conn-denied");
     let _ = Vault::delete_connection_id();
 
     let cloud_server = MockServer::start().await;
@@ -650,6 +690,8 @@ async fn test_token_revocation_on_heartbeat() {
         tally_reachable: true,
         agent_version: "0.1.0".into(),
         last_known_alter_id: 100,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        last_successful_sync_at: None,
     };
 
     let result = client.heartbeat(&payload).await;
@@ -1136,8 +1178,10 @@ async fn test_zero_delta_sync_pushes_empty_batch() {
     Mock::given(method("POST"))
         .and(path("/api/v1/agent/sync/delta"))
         .and(wiremock::matchers::body_json(serde_json::json!({
+            "companyName": "Acme Corp Ltd",
             "records": [],
-            "alter_id_high": 100
+            "alter_id_high": 100,
+            "newAlterId": "100"
         })))
         .respond_with(ResponseTemplate::new(200))
         .mount(&cloud_server)
@@ -1224,7 +1268,7 @@ async fn test_disconnect_preserves_checkpoint_file() {
     assert!(checkpoint_file.exists(), "Checkpoint file must be preserved on disconnect");
     let preserved_cp = cp_store.load().unwrap();
     assert_eq!(preserved_cp.last_known_alter_id, 500);
-    assert_eq!(preserved_cp.backfill_complete, true);
+    assert!(preserved_cp.backfill_complete);
 }
 
 #[tokio::test]
@@ -1432,7 +1476,7 @@ async fn test_crash_after_push_before_checkpoint_does_not_corrupt_state() {
     // If agent process crashes right after pushing to gateway, checkpoint is still at 100
     let cp = store.load().unwrap();
     assert_eq!(cp.last_known_alter_id, 100);
-    assert_eq!(cp.backfill_complete, true);
+    assert!(cp.backfill_complete);
     // State is intact and valid JSON
 }
 
@@ -2085,11 +2129,11 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
     let wiresnaks_a = items_a.iter().find(|i| i.company_name == "WireSnaks").unwrap();
 
     assert_eq!(demo_a.status, "Connected · Active");
-    assert_eq!(demo_a.is_active_in_tally, true);
+    assert!(demo_a.is_active_in_tally);
     assert_eq!(thunder_a.status, "Connected · Inactive");
-    assert_eq!(thunder_a.is_active_in_tally, false);
+    assert!(!thunder_a.is_active_in_tally);
     assert_eq!(wiresnaks_a.status, "Available · Inactive");
-    assert_eq!(wiresnaks_a.is_active_in_tally, false);
+    assert!(!wiresnaks_a.is_active_in_tally);
 
     // Transition B: User switches active company in Tally to ThunderClaps
     *active_name.lock().unwrap() = "ThunderClaps".to_string();
@@ -2101,11 +2145,11 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
     let wiresnaks_b = items_b.iter().find(|i| i.company_name == "WireSnaks").unwrap();
 
     assert_eq!(demo_b.status, "Connected · Inactive");
-    assert_eq!(demo_b.is_active_in_tally, false);
+    assert!(!demo_b.is_active_in_tally);
     assert_eq!(thunder_b.status, "Connected · Active");
-    assert_eq!(thunder_b.is_active_in_tally, true);
+    assert!(thunder_b.is_active_in_tally);
     assert_eq!(wiresnaks_b.status, "Available · Inactive");
-    assert_eq!(wiresnaks_b.is_active_in_tally, false);
+    assert!(!wiresnaks_b.is_active_in_tally);
 
     // Transition C: User switches active company in Tally to WireSnaks (unconnected)
     *active_name.lock().unwrap() = "WireSnaks".to_string();
@@ -2117,11 +2161,11 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
     let wiresnaks_c = items_c.iter().find(|i| i.company_name == "WireSnaks").unwrap();
 
     assert_eq!(demo_c.status, "Connected · Inactive");
-    assert_eq!(demo_c.is_active_in_tally, false);
+    assert!(!demo_c.is_active_in_tally);
     assert_eq!(thunder_c.status, "Connected · Inactive");
-    assert_eq!(thunder_c.is_active_in_tally, false);
+    assert!(!thunder_c.is_active_in_tally);
     assert_eq!(wiresnaks_c.status, "Available · Active");
-    assert_eq!(wiresnaks_c.is_active_in_tally, true);
+    assert!(wiresnaks_c.is_active_in_tally);
 
     // Transition D: User switches back to DemoCorp
     *active_name.lock().unwrap() = "DemoCorp".to_string();
@@ -2133,11 +2177,11 @@ async fn test_active_company_dynamic_transitions_a_b_c_d() {
     let wiresnaks_d = items_d.iter().find(|i| i.company_name == "WireSnaks").unwrap();
 
     assert_eq!(demo_d.status, "Connected · Active");
-    assert_eq!(demo_d.is_active_in_tally, true);
+    assert!(demo_d.is_active_in_tally);
     assert_eq!(thunder_d.status, "Connected · Inactive");
-    assert_eq!(thunder_d.is_active_in_tally, false);
+    assert!(!thunder_d.is_active_in_tally);
     assert_eq!(wiresnaks_d.status, "Available · Inactive");
-    assert_eq!(wiresnaks_d.is_active_in_tally, false);
+    assert!(!wiresnaks_d.is_active_in_tally);
 }
 
 #[tokio::test]
@@ -2314,8 +2358,8 @@ async fn test_tally_offline_preserves_connected_state_and_recovers_cleanly() {
     assert_eq!(cached_offline.len(), 2, "Both connected companies must remain present in cache when offline");
     assert_eq!(cached_offline[0].status, "Offline");
     assert_eq!(cached_offline[1].status, "Offline");
-    assert_eq!(cached_offline[0].is_connected, true);
-    assert_eq!(cached_offline[1].is_connected, true);
+    assert!(cached_offline[0].is_connected);
+    assert!(cached_offline[1].is_connected);
 }
 
 #[test]
@@ -2677,6 +2721,8 @@ async fn test_backend_401_explicit_revocation_vs_transient_failure() {
         tally_reachable: true,
         agent_version: "1.0.0".into(),
         last_known_alter_id: 0,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        last_successful_sync_at: None,
     };
 
     let err = client.heartbeat(&payload).await.unwrap_err();
@@ -2761,6 +2807,8 @@ async fn test_sync_and_heartbeat_fail_not_paired_when_connection_token_missing_e
         tally_reachable: false,
         agent_version: "0.1.0".into(),
         last_known_alter_id: 0,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        last_successful_sync_at: None,
     }).await;
     assert!(
         matches!(hb_res, Err(fininsight_tally_agent_lib::errors::ApiError::NotPaired)),

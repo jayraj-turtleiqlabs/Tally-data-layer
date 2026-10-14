@@ -845,22 +845,6 @@ impl AgentState {
         Ok(())
     }
 
-    // Legacy compatibility methods
-    pub async fn pair(&self, code: &str) -> Result<String, AgentError> {
-        let tally = self.new_tally_client()?;
-        let company = tally.ping().await?;
-        let cloud = self.new_cloud_client()?;
-        let response = cloud.pair(code, &company.company_name).await?;
-        let token = response.token()?;
-        let cid = response.connection_id().unwrap_or_else(|| "default-connection".into());
-        self.complete_pairing_for_company(
-            &cid,
-            &token,
-            &company.company_name,
-            company.company_guid.as_deref(),
-        )
-        .await
-    }
 
     pub async fn start_device_login(&self) -> Result<DeviceAuthPublicSession, AgentError> {
         let tally = self.new_tally_client()?;
@@ -1015,6 +999,8 @@ pub fn spawn_heartbeat_loop(state: Arc<AgentState>) {
                             tally_reachable: tally_reachable && is_active,
                             agent_version: AGENT_VERSION.to_string(),
                             last_known_alter_id: checkpoint.last_known_alter_id,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            last_successful_sync_at: checkpoint.last_successful_sync,
                         };
 
                         match cloud.heartbeat(&payload).await {

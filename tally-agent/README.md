@@ -9,7 +9,7 @@ Windows desktop system-tray agent that bridges a locally installed **Tally ERP 9
 | Tally endpoint is loopback only | `TallyEndpoint::new()` rejects non-`127.0.0.1` hosts at startup |
 | No inbound connections | All cloud communication is outbound HTTPS; no listening sockets |
 | Read-only against Tally | `EnvelopeDirection` enum has **only** `Export` — no Import variant exists |
-| One-way cloud pipe | `CloudClient` only POSTs (pair, sync push, heartbeat) — no data fetch |
+| One-way cloud pipe | `CloudClient` only POSTs (device auth, sync push, heartbeat) — no data fetch |
 | Token in OS vault | `keyring` crate → Windows Credential Manager |
 | Fail loud | Typed errors; no cached/mock/synthesized data on Tally failure |
 | Checkpoint on ack only | `CheckpointStore::advance_on_ack()` called only after HTTP 200 |
@@ -77,7 +77,7 @@ npm run tauri dev
 
 1. `tally_client.rs` + `tally_envelope.rs` + `tally_schema.rs` — Export-only Tally XML
 2. `vault.rs` — OS credential vault
-3. `cloud_client.rs` — pairing, sync push, heartbeat
+3. `cloud_client.rs` — device auth, sync push, heartbeat
 4. Initial backfill (automatic post-pairing, batched)
 5. On-demand sync (tray "Sync Now" button — **no background sync timer**)
 6. Heartbeat loop (45s interval, decoupled from sync)
@@ -89,7 +89,7 @@ npm run tauri dev
 
 ```
 tally-agent/
-├── src/                    # Tray/pairing UI (Vite + TypeScript)
+├── src/                    # Tray UI (Vite + TypeScript)
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs         # Entry, tray, Tauri commands
@@ -97,7 +97,7 @@ tally-agent/
 │   │   ├── tally_client.rs # Local Tally XML (Export-only)
 │   │   ├── tally_envelope.rs # Type-level Export-only envelopes
 │   │   ├── tally_schema.rs # ERP9 vs TallyPrime adapter
-│   │   ├── cloud_client.rs # Pairing, sync push, heartbeat
+│   │   ├── cloud_client.rs # Device auth, sync push, heartbeat
 │   │   ├── vault.rs        # Windows Credential Manager
 │   │   ├── checkpoint.rs   # ALTERID checkpoint persistence
 │   │   ├── sync.rs         # Backfill + on-demand sync orchestration
@@ -113,10 +113,11 @@ tally-agent/
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/v1/agent/pair` | Pair with 8-char code |
-| POST | `/api/v1/sync/initial` | Initial backfill batches |
-| POST | `/api/v1/sync/delta` | Incremental sync push |
-| POST | `/api/v1/agent/heartbeat` | Liveness + optional sync-request poll |
+| POST | `/api/v1/agent/device/initiate` | Initiate device-flow pairing |
+| POST | `/api/v1/agent/device/poll` | Poll device pairing status |
+| POST | `/api/v1/agent/sync/delta` | Backfill batches & incremental delta sync |
+| POST | `/api/v1/agent/heartbeat` | Liveness, sliding token extension & sync_requested poll |
+| POST | `/api/v1/agent/revoke` | Revoke agent connection |
 
 ## Sync Model
 

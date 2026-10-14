@@ -308,11 +308,13 @@ impl SyncOrchestrator {
             let batch_alter_high = chunk.iter().map(|(_, _, id)| *id).max().unwrap_or(0);
 
             let batch = SyncBatchPayload {
+                company_name: Some(company.company_name.clone()),
                 batch_index: batch_index as u32,
                 total_batches,
                 entity_type,
                 records,
                 alter_id_high: batch_alter_high,
+                new_alter_id: batch_alter_high.to_string(),
             };
 
             self.cloud.push_initial_batch(&batch).await?;
@@ -360,19 +362,22 @@ impl SyncOrchestrator {
             return Err(AgentError::BackfillRequired);
         }
 
-        let _company = self.verify_active_company().await?;
+        let company = self.verify_active_company().await?;
 
         let last_known = checkpoint.last_known_alter_id;
         log::info!("Delta sync from ALTERID > {}", last_known);
 
+        // TODO: Handle deleted or cancelled Tally vouchers in delta sync
         let mut deltas = self.tally.export_delta(last_known).await?;
         deltas.retain(|d| d.alter_id > last_known);
 
         if deltas.is_empty() {
             log::info!("Delta sync found 0 new records since ALTERID > {}. Pushing empty batch to acknowledge sync.", last_known);
             let empty_payload = DeltaSyncPayload {
+                company_name: Some(company.company_name.clone()),
                 records: vec![],
                 alter_id_high: last_known,
+                new_alter_id: last_known.to_string(),
             };
             match self.cloud.push_delta(&empty_payload).await {
                 Ok(()) => {
@@ -391,10 +396,10 @@ impl SyncOrchestrator {
                 Err(e) => {
                     log::warn!("Zero-delta push note: {}", redact(&e.to_string()));
                     return Ok(SyncResult {
-                        success: true,
+                        success: false,
                         records_pushed: 0,
-                        new_alter_id: Some(last_known),
-                        error_message: None,
+                        new_alter_id: None,
+                        error_message: Some(format!("Sync failed: {}", e)),
                     });
                 }
             }
@@ -414,8 +419,10 @@ impl SyncOrchestrator {
         let alter_id_high = deltas.iter().map(|d| d.alter_id).max().unwrap_or(last_known);
 
         let payload = DeltaSyncPayload {
+            company_name: Some(company.company_name.clone()),
             records,
             alter_id_high,
+            new_alter_id: alter_id_high.to_string(),
         };
 
         // Push to backend — checkpoint NOT advanced on failure
