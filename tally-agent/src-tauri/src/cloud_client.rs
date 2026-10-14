@@ -11,16 +11,11 @@ use crate::device_auth::{
 use crate::errors::ApiError;
 use crate::redact::redact;
 
-/// Resolved at runtime via FININSIGHT_API_BASE env var, falling back to compile-time env or production Render base.
+/// Resolved at runtime via FININSIGHT_API_BASE env var, falling back to production base.
 pub fn api_base_url() -> String {
-    std::env::var("FININSIGHT_API_BASE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            option_env!("FININSIGHT_API_BASE")
-                .unwrap_or("https://fininsight-api-vzv5.onrender.com")
-                .to_string()
-        })
+    let base_url = std::env::var("FININSIGHT_API_BASE")
+        .unwrap_or_else(|_| "https://fin.turtleiqlabs.com".to_string());
+    base_url
 }
 
 #[derive(Debug, Clone, Serialize)]
