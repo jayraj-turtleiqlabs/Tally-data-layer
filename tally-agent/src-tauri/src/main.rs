@@ -83,20 +83,6 @@ async fn get_agent_status(state: tauri::State<'_, Arc<AgentState>>) -> Result<Ag
     Ok(state.get_status().await)
 }
 
-#[tauri::command]
-async fn pair_agent(
-    code: String,
-    state: tauri::State<'_, Arc<AgentState>>,
-) -> Result<String, String> {
-    state
-        .pair(&code)
-        .await
-        .map_err(|e| {
-            let msg = format!("{}", e);
-            log::error!("[pair_agent] Error: {}", msg);
-            msg
-        })
-}
 
 #[tauri::command]
 async fn initiate_device_login(
@@ -210,7 +196,6 @@ fn main() {
             sync_company,
             disconnect_company,
             get_agent_status,
-            pair_agent,
             initiate_device_login,
             poll_device_login,
             cancel_device_login,

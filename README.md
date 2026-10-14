@@ -5,14 +5,14 @@ Monorepo containing two components of the FinInsight ↔ Tally integration:
 | Directory | Description |
 |---|---|
 | [`tally-agent/`](tally-agent/) | Windows desktop system-tray agent (Tauri 2 + Rust) — bridges local Tally to FinInsight cloud |
-| [`fininsight-web/`](fininsight-web/) | React web dashboard — login, pairing, team management, connection switching |
+| [`fininsight-web/`](fininsight-web/) | React web dashboard — login, device connection approval, team management, connection switching |
 
 ## Architecture
 
 ```
 ┌─────────────┐     Export XML      ┌──────────────┐     HTTPS POST      ┌─────────────────┐
 │ Tally ERP9/ │ ◄────────────────── │ FinInsight   │ ──────────────────► │ FinInsight      │
-│ TallyPrime  │   127.0.0.1:9000    │ Tally Agent  │  (pair/sync/beat)   │ Backend API     │
+│ TallyPrime  │   127.0.0.1:9000    │ Tally Agent  │ (device/sync/beat)  │ Backend API     │
 └─────────────┘                     └──────────────┘                     └─────────────────┘
                                            ▲                                      ▲
                                            │ User: Sync Now                       │ JWT auth

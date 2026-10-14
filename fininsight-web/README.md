@@ -1,6 +1,6 @@
 # FinInsight Web Dashboard
 
-React frontend for the FinInsight accounting SaaS. Implements secure login integration with the existing Express/Prisma backend — in-memory JWT storage, HttpOnly refresh cookies, protected routes (UX only), pairing code generation, team management, and connection switching.
+React frontend for the FinInsight accounting SaaS. Implements secure login integration with the existing Express/Prisma backend — in-memory JWT storage, HttpOnly refresh cookies, protected routes (UX only), device pairing approval instructions, team management, and connection switching.
 
 ## Security Model
 
@@ -29,7 +29,7 @@ The dev server proxies `/api` to `http://localhost:3000` (override with `VITE_AP
 | Silent refresh on load | `AuthProvider` |
 | Token refresh interceptor | `api/client.ts` |
 | Protected dashboard | `ProtectedRoute` |
-| Pairing code (OWNER/ADMIN) | `PairingPanel` |
+| Device flow instructions (OWNER/ADMIN) | `PairingPanel` |
 | Sync Now flag (dashboard) | `PairingPanel` → agent polls heartbeat |
 | Team management | `TeamManagement` |
 | Connection switcher | `ConnectionSwitcher` |
@@ -49,7 +49,6 @@ Covers: no token in storage, role-based UI visibility, generic login errors, sin
 | POST | `/api/v1/auth/login` |
 | POST | `/api/v1/auth/refresh` |
 | GET | `/api/v1/connections` |
-| POST | `/api/v1/agent/pairing/initiate` |
-| POST | `/api/v1/connections/:id/sync-request` |
+| POST | `/api/v1/connections/:id/sync` |
 | GET | `/api/v1/organization/members` |
-| POST | `/api/v1/organization/members/invite` |
+| POST | `/api/v1/organization/members` |

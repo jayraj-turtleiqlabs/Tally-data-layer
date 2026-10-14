@@ -20,11 +20,9 @@ export interface Connection {
 
 export interface OrgMember {
   id: string;
+  userId?: string;
+  name?: string;
   email: string;
   role: UserRole;
-}
-
-export interface PairingInitResponse {
-  pairingCode: string;
-  expiresAt: string;
+  createdAt?: string;
 }

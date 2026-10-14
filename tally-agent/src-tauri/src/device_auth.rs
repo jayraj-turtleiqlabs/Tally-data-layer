@@ -274,7 +274,7 @@ pub async fn initiate_device_auth_with_prev_cid(
 
     let resp = cloud_client.initiate_device(&request).await?;
 
-    let poll_interval_secs = resp.interval().unwrap_or(5).max(1);
+    let poll_interval_secs = resp.interval().unwrap_or(6).max(6);
     let expires_at = Instant::now() + Duration::from_secs(resp.expires_in());
 
     log::info!(
@@ -494,8 +494,53 @@ mod tests {
         assert_eq!(session.device_code, "dev-12345");
         assert_eq!(session.user_code, "WDJB-4K9P");
         assert_eq!(session.verification_uri, "https://app.fininsight.io/device");
-        assert_eq!(session.poll_interval_secs, 5);
+        assert_eq!(session.poll_interval_secs, 6);
         assert!(session.expires_at > Instant::now());
+    }
+
+    #[tokio::test]
+    async fn test_initiate_device_auth_interval_defaults_to_at_least_6s() {
+        let server = MockServer::start().await;
+        let response_body_no_interval = serde_json::json!({
+            "device_code": "dev-no-int",
+            "user_code": "NOINT-123",
+            "verification_uri": "https://app.fininsight.io/device",
+            "expires_in": 300
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/device/initiate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body_no_interval))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri()).unwrap();
+        let session = initiate_device_auth(&client, "Acme Corp Ltd").await.unwrap();
+
+        assert_eq!(session.poll_interval_secs, 6, "Must default to at least 6s when interval is omitted");
+    }
+
+    #[tokio::test]
+    async fn test_initiate_device_auth_accepts_interval_greater_than_6s() {
+        let server = MockServer::start().await;
+        let response_body = serde_json::json!({
+            "device_code": "dev-10s",
+            "user_code": "TEN-123",
+            "verification_uri": "https://app.fininsight.io/device",
+            "expires_in": 300,
+            "interval": 10
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/agent/device/initiate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::from_base_url(&server.uri()).unwrap();
+        let session = initiate_device_auth(&client, "Acme Corp Ltd").await.unwrap();
+
+        assert_eq!(session.poll_interval_secs, 10, "Must respect interval when greater than 6s");
     }
 
     #[test]
