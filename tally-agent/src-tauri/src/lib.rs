@@ -1,9 +1,12 @@
+pub mod auto_sync;
+pub mod autostart;
 pub mod checkpoint;
 pub mod cloud_client;
 pub mod device_auth;
 pub mod errors;
 pub mod logging;
 pub mod redact;
+pub mod settings;
 pub mod sync;
 pub mod tally_client;
 pub mod tally_envelope;
@@ -16,6 +19,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
+
+pub use auto_sync::{spawn_auto_sync_loop, SyncReminderState};
+pub use autostart::{is_autostart_registered, set_autostart_registered, sync_autostart_with_settings};
+pub use settings::{AppSettings, SettingsStore};
 
 use crate::checkpoint::{Checkpoint, CheckpointStore, ConnectionProfile, ProfileStore};
 use crate::cloud_client::{CloudClient, HeartbeatPayload};
@@ -136,6 +143,8 @@ pub struct AgentState {
     pub per_company_errors: RwLock<HashMap<String, String>>,
     pub syncing_connections: RwLock<HashMap<String, bool>>,
     pub connection_backoffs: RwLock<HashMap<String, ConnectionBackoff>>,
+    pub settings_store: SettingsStore,
+    pub sync_reminder: RwLock<SyncReminderState>,
 }
 
 pub fn matches_company(
@@ -178,6 +187,11 @@ impl AgentState {
             base_dir.join("profiles.json")
         };
         let profile_store = ProfileStore::new(profile_path);
+        let settings_path = base_dir.join("settings.json");
+        let settings_store = SettingsStore::new(settings_path);
+        if let Ok(settings) = settings_store.load() {
+            let _ = autostart::sync_autostart_with_settings(settings.autostart_enabled);
+        }
         let profiles = profile_store.load_all().unwrap_or_default();
         let first_profile = profiles.into_iter().next();
 
@@ -239,6 +253,8 @@ impl AgentState {
             per_company_errors: RwLock::new(HashMap::new()),
             syncing_connections: RwLock::new(HashMap::new()),
             connection_backoffs: RwLock::new(HashMap::new()),
+            settings_store,
+            sync_reminder: RwLock::new(SyncReminderState::default()),
         })
     }
 
@@ -845,6 +861,24 @@ impl AgentState {
         Ok(())
     }
 
+    /// Reset checkpoint for a connection to force a full re-sync without disconnecting.
+    pub async fn reset_checkpoint_for_connection(&self, connection_id: &str) -> Result<(), AgentError> {
+        let conn_checkpoint_store = self.checkpoint_store_for_connection(connection_id);
+        conn_checkpoint_store.reset_for_full_resync()?;
+        log::info!(
+            "[sync] Checkpoint reset for connection_id='{}' (last_known_alter_id=0, backfill_complete=false)",
+            connection_id
+        );
+        let _ = self.discover_and_merge_companies().await;
+        Ok(())
+    }
+
+    /// Performs a full re-sync for a connection by resetting checkpoint and triggering initial backfill.
+    pub async fn full_resync_company(&self, connection_id: &str) -> Result<SyncResult, AgentError> {
+        self.reset_checkpoint_for_connection(connection_id).await?;
+        self.sync_company(connection_id).await
+    }
+
 
     pub async fn start_device_login(&self) -> Result<DeviceAuthPublicSession, AgentError> {
         let tally = self.new_tally_client()?;
@@ -943,6 +977,32 @@ impl AgentState {
     pub async fn get_status(&self) -> AgentStatus {
         let _ = self.discover_and_merge_companies().await;
         self.status.read().await.clone()
+    }
+
+    pub async fn get_sync_reminder(&self) -> SyncReminderState {
+        let settings = self.settings_store.load().unwrap_or_default();
+        if self.settings_store.is_snoozed(&settings) {
+            return SyncReminderState::default();
+        }
+        self.sync_reminder.read().await.clone()
+    }
+
+    pub async fn set_sync_reminder(&self, reminder: SyncReminderState) {
+        let mut lock = self.sync_reminder.write().await;
+        *lock = reminder;
+    }
+
+    pub async fn clear_sync_reminder(&self) {
+        let mut lock = self.sync_reminder.write().await;
+        *lock = SyncReminderState::default();
+    }
+
+    pub async fn dismiss_sync_reminder(&self, snooze_minutes: Option<i64>) -> Result<(), String> {
+        if let Some(mins) = snooze_minutes {
+            self.settings_store.snooze_for_minutes(mins)?;
+        }
+        self.clear_sync_reminder().await;
+        Ok(())
     }
 }
 

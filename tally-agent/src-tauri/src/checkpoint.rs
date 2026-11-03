@@ -302,6 +302,15 @@ impl CheckpointStore {
         Ok(cp)
     }
 
+    /// Reset checkpoint to force a full re-sync (alter_id=0, backfill_complete=false) without disconnecting.
+    pub fn reset_for_full_resync(&self) -> Result<Checkpoint, CheckpointError> {
+        let mut cp = self.load()?;
+        cp.last_known_alter_id = 0;
+        cp.backfill_complete = false;
+        self.save(&cp)?;
+        Ok(cp)
+    }
+
     /// Conservative migration from legacy single checkpoint.json.
     /// Migrates only if connection-scoped checkpoint does not exist and legacy checkpoint is valid.
     pub fn migrate_legacy_if_needed(&self, connection_id: &str) -> Result<(), CheckpointError> {
@@ -489,6 +498,25 @@ mod tests {
         assert_eq!(migrated.connection_id.as_deref(), Some("conn-999"));
         assert_eq!(migrated.last_known_alter_id, 1500);
         assert!(migrated.backfill_complete);
+    }
+
+    #[test]
+    fn checkpoint_reset_for_full_resync() {
+        let dir = tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path().join("cp.json"));
+        store.advance_on_ack(500, true).unwrap();
+
+        let cp = store.load().unwrap();
+        assert_eq!(cp.last_known_alter_id, 500);
+        assert!(cp.backfill_complete);
+
+        let reset_cp = store.reset_for_full_resync().unwrap();
+        assert_eq!(reset_cp.last_known_alter_id, 0);
+        assert!(!reset_cp.backfill_complete);
+
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.last_known_alter_id, 0);
+        assert!(!reloaded.backfill_complete);
     }
 }
 

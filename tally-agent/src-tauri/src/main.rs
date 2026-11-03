@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use fininsight_tally_agent_lib::{
-    spawn_heartbeat_loop, AgentState, AgentStatus, CompanyItem, DeviceAuthPublicSession,
+    spawn_auto_sync_loop, spawn_heartbeat_loop, AgentState, AgentStatus, AppSettings, CompanyItem,
+    DeviceAuthPublicSession, SyncReminderState,
 };
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, RunEvent, WindowEvent,
+    Emitter, Manager, RunEvent, WindowEvent,
 };
 
 static IS_QUITTING: AtomicBool = AtomicBool::new(false);
@@ -71,6 +72,27 @@ async fn sync_company(
 }
 
 #[tauri::command]
+async fn reset_checkpoint(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    state.reset_checkpoint_for_connection(&connection_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn full_resync_company(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    let result = state.full_resync_company(&connection_id).await.map_err(|e| e.to_string())?;
+    if result.success {
+        Ok(())
+    } else {
+        Err(result.error_message.unwrap_or_else(|| "Full resync failed.".into()))
+    }
+}
+
+#[tauri::command]
 async fn disconnect_company(
     connection_id: String,
     state: tauri::State<'_, Arc<AgentState>>,
@@ -82,7 +104,6 @@ async fn disconnect_company(
 async fn get_agent_status(state: tauri::State<'_, Arc<AgentState>>) -> Result<AgentStatus, String> {
     Ok(state.get_status().await)
 }
-
 
 #[tauri::command]
 async fn initiate_device_login(
@@ -161,6 +182,39 @@ async fn show_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn get_app_settings(state: tauri::State<'_, Arc<AgentState>>) -> Result<AppSettings, String> {
+    state.settings_store.load().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_app_settings(
+    settings: AppSettings,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    state.settings_store.save(&settings).map_err(|e| e.to_string())?;
+    let _ = fininsight_tally_agent_lib::autostart::set_autostart_registered(settings.autostart_enabled);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_sync_reminder(state: tauri::State<'_, Arc<AgentState>>) -> Result<SyncReminderState, String> {
+    Ok(state.get_sync_reminder().await)
+}
+
+#[tauri::command]
+async fn dismiss_sync_reminder(
+    snooze_minutes: Option<i64>,
+    state: tauri::State<'_, Arc<AgentState>>,
+) -> Result<(), String> {
+    state.dismiss_sync_reminder(snooze_minutes).await
+}
+
+#[tauri::command]
+async fn check_tally_status(state: tauri::State<'_, Arc<AgentState>>) -> Result<bool, String> {
+    Ok(state.check_tally_reachable().await)
+}
+
 fn main() {
     let _ = fininsight_tally_agent_lib::logging::init_logging();
 
@@ -180,11 +234,15 @@ fn main() {
         std::process::exit(1);
     }
 
+    let is_autostart = std::env::args().any(|arg| arg == "--autostart" || arg == "--minimized");
+
     let agent_state = Arc::new(
         AgentState::new(tally_port).expect("Failed to initialize agent state"),
     );
 
     spawn_heartbeat_loop(agent_state.clone());
+
+    let state_for_setup = agent_state.clone();
 
     tauri::Builder::default()
         .manage(agent_state)
@@ -194,6 +252,8 @@ fn main() {
             initiate_company_connection,
             poll_company_connection,
             sync_company,
+            reset_checkpoint,
+            full_resync_company,
             disconnect_company,
             get_agent_status,
             initiate_device_login,
@@ -203,8 +263,13 @@ fn main() {
             sync_now,
             disconnect_agent,
             show_window,
+            get_app_settings,
+            update_app_settings,
+            get_sync_reminder,
+            dismiss_sync_reminder,
+            check_tally_status,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let show_i = MenuItem::with_id(app, "show", "Show FinInsight Agent", true, None::<&str>)?;
             let sync_i = MenuItem::with_id(app, "sync", "Sync Now", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -255,10 +320,41 @@ fn main() {
                 })
                 .build(app)?;
 
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.unminimize();
-                let _ = w.show();
-                let _ = w.set_focus();
+            // Start auto-sync worker
+            spawn_auto_sync_loop(app.handle().clone(), state_for_setup.clone());
+
+            if is_autostart {
+                log::info!("[startup] Launched via autostart/minimized. Window initially kept hidden in tray.");
+                let app_handle = app.handle().clone();
+                let state_clone = state_for_setup.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let reachable = state_clone.check_tally_reachable().await;
+                    if !reachable {
+                        log::warn!("[startup] Tally is offline on boot. Showing window with reminder.");
+                        if let Some(w) = app_handle.get_webview_window("main") {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                        let _ = app_handle.emit("tally-offline-detected", true);
+                    }
+                });
+            } else {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+                let app_handle = app.handle().clone();
+                let state_clone = state_for_setup.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let reachable = state_clone.check_tally_reachable().await;
+                    if !reachable {
+                        let _ = app_handle.emit("tally-offline-detected", true);
+                    }
+                });
             }
 
             Ok(())

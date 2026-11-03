@@ -44,6 +44,9 @@ pub enum ApiError {
     #[error("Heartbeat failed with status {0}")]
     HeartbeatFailed(u16),
 
+    #[error("Gateway is slow to respond (request timed out). Please try again.")]
+    GatewayTimeout,
+
     #[error("Network error: {0}")]
     Network(String),
 
@@ -58,6 +61,19 @@ pub enum ApiError {
 
     #[error("This login request expired — try again")]
     DeviceAuthExpired,
+}
+
+impl ApiError {
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            ApiError::GatewayTimeout => true,
+            ApiError::Network(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                lower.contains("timed out") || lower.contains("timeout")
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

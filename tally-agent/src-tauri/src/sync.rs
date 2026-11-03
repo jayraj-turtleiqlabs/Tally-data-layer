@@ -317,7 +317,31 @@ impl SyncOrchestrator {
                 new_alter_id: batch_alter_high.to_string(),
             };
 
-            self.cloud.push_initial_batch(&batch).await?;
+            let mut type_counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for (t, _, _) in chunk {
+                *type_counts.entry(t.as_str()).or_insert(0) += 1;
+            }
+            let first_keys: Vec<String> = chunk
+                .first()
+                .and_then(|(_, v, _)| v.as_object())
+                .map(|obj| obj.keys().cloned().collect())
+                .unwrap_or_default();
+
+            log::info!(
+                "[push] Initial batch {}/{} (total_records: {}, counts_by_entity_type: {:?}, first_record_keys: {:?})",
+                batch_index + 1,
+                total_batches,
+                chunk.len(),
+                type_counts,
+                first_keys
+            );
+
+            if let Err(e) = self.cloud.push_initial_batch(&batch).await {
+                if e.is_timeout() {
+                    return Err(AgentError::Api(crate::errors::ApiError::GatewayTimeout));
+                }
+                return Err(AgentError::Api(e));
+            }
             pushed += chunk.len();
         }
 
@@ -395,11 +419,16 @@ impl SyncOrchestrator {
                 }
                 Err(e) => {
                     log::warn!("Zero-delta push note: {}", redact(&e.to_string()));
+                    let error_message = if e.is_timeout() {
+                        "Gateway is slow to respond (request timed out). Please try again.".to_string()
+                    } else {
+                        format!("Sync failed: {}", e)
+                    };
                     return Ok(SyncResult {
                         success: false,
                         records_pushed: 0,
                         new_alter_id: None,
-                        error_message: Some(format!("Sync failed: {}", e)),
+                        error_message: Some(error_message),
                     });
                 }
             }
@@ -425,6 +454,24 @@ impl SyncOrchestrator {
             new_alter_id: alter_id_high.to_string(),
         };
 
+        let mut type_counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for d in &deltas {
+            *type_counts.entry(d.entity_type.as_str()).or_insert(0) += 1;
+        }
+        let first_keys: Vec<String> = payload
+            .records
+            .first()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        log::info!(
+            "[push] Delta batch 1/1 (total_records: {}, counts_by_entity_type: {:?}, first_record_keys: {:?})",
+            deltas.len(),
+            type_counts,
+            first_keys
+        );
+
         // Push to backend — checkpoint NOT advanced on failure
         match self.cloud.push_delta(&payload).await {
             Ok(()) => {
@@ -442,11 +489,16 @@ impl SyncOrchestrator {
             }
             Err(e) => {
                 log::error!("Delta sync push failed: {}", redact(&e.to_string()));
+                let error_message = if e.is_timeout() {
+                    "Gateway is slow to respond (request timed out). Please try again.".to_string()
+                } else {
+                    "Sync failed. Please try again.".to_string()
+                };
                 Ok(SyncResult {
                     success: false,
                     records_pushed: 0,
                     new_alter_id: None,
-                    error_message: Some("Sync failed. Please try again.".into()),
+                    error_message: Some(error_message),
                 })
             }
         }

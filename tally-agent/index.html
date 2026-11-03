@@ -13,13 +13,118 @@
           <h1>FinInsight Tally Agent</h1>
           <span id="tally-status-badge" class="badge badge-idle">Checking Tally…</span>
         </div>
-        <button id="refresh-btn" class="btn-icon-action" title="Refresh Tally companies">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
-          </svg>
-          <span>Refresh</span>
-        </button>
+        <div class="header-actions">
+          <button id="settings-toggle-btn" class="btn-icon-action" title="Preferences">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+          </button>
+          <button id="refresh-btn" class="btn-icon-action" title="Refresh Tally companies">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+            <span>Refresh</span>
+          </button>
+        </div>
       </header>
+
+      <!-- Settings Dropdown / Panel -->
+      <section id="settings-panel" class="card settings-panel hidden">
+        <div class="settings-header">
+          <h3>Preferences</h3>
+          <button id="close-settings-btn" class="close-icon-btn" title="Close Settings">&times;</button>
+        </div>
+        <div class="setting-row">
+          <div class="setting-text">
+            <label for="autostart-toggle" class="setting-label">Start on Windows boot</label>
+            <span class="setting-hint">Launch in tray when PC starts</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autostart-toggle" checked />
+            <span class="slider round"></span>
+          </label>
+        </div>
+        <div class="setting-row">
+          <div class="setting-text">
+            <label for="auto-sync-interval-select" class="setting-label">Automatic sync interval</label>
+            <span class="setting-hint">Auto-sync active company</span>
+          </div>
+          <select id="auto-sync-interval-select" class="select-field">
+            <option value="15">Every 15 min</option>
+            <option value="30">Every 30 min</option>
+            <option value="60" selected>Every 1 hour</option>
+            <option value="120">Every 2 hours</option>
+            <option value="240">Every 4 hours</option>
+            <option value="0">Disabled</option>
+          </select>
+        </div>
+      </section>
+
+      <!-- Tally Offline Modal -->
+      <section id="tally-offline-modal" class="card modal hidden">
+        <div class="modal-content">
+          <div class="modal-badge-icon warning-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path>
+              <line x1="12" y1="9" x2="12" y2="13"></line>
+              <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            </svg>
+          </div>
+          <h2>Tally is Not Open</h2>
+          <p class="hint">FinInsight cannot connect to Tally on port 9000.</p>
+          
+          <div class="instructions-card">
+            <div class="instruction-item">
+              <span class="step-num">1</span>
+              <span>Open <strong>Tally ERP 9</strong> or <strong>TallyPrime</strong></span>
+            </div>
+            <div class="instruction-item">
+              <span class="step-num">2</span>
+              <span>Ensure Tally XML server is active on port <strong>9000</strong></span>
+            </div>
+            <div class="instruction-item">
+              <span class="step-num">3</span>
+              <span>Load your company in Tally</span>
+            </div>
+          </div>
+
+          <div class="modal-btn-row">
+            <button id="check-tally-again-btn" class="btn primary">Check Again</button>
+            <button id="dismiss-tally-modal-btn" class="btn secondary">Dismiss</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Data Sync Needed / Overdue Modal -->
+      <section id="sync-reminder-modal" class="card modal hidden">
+        <div class="modal-content">
+          <div class="modal-badge-icon alert-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+          </div>
+          <h2>Data Sync Needed</h2>
+          <p id="sync-reminder-reason" class="hint reminder-text">Scheduled auto-sync could not complete.</p>
+
+          <div class="sync-meta-box">
+            <div class="meta-row">
+              <span class="meta-label">Company:</span>
+              <strong id="reminder-company-name">--</strong>
+            </div>
+            <div class="meta-row">
+              <span class="meta-label">Last Successful Sync:</span>
+              <span id="reminder-last-sync">Never</span>
+            </div>
+          </div>
+
+          <div class="modal-btn-row">
+            <button id="reminder-sync-now-btn" class="btn primary">Sync Now</button>
+            <button id="reminder-snooze-btn" class="btn secondary">Remind Me in 15 Min</button>
+          </div>
+        </div>
+      </section>
 
       <!-- Connection / Device Login Modal -->
       <section id="auth-modal" class="card modal hidden">

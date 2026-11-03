@@ -18,18 +18,19 @@ if (!fs.existsSync(outDir)) {
 }
 
 // 1. Build frontend
-console.log("[1/3] Building frontend assets (Vite + TypeScript)...");
+console.log("[1/4] Building frontend assets (Vite + TypeScript)...");
 execSync("npm run build", { cwd: rootDir, stdio: "inherit" });
 
 // 2. Build Tauri release (Bundles Rust + Embedded Frontend into single binary)
-console.log("\n[2/3] Compiling Tauri release binary & bundle...");
+console.log("\n[2/4] Compiling Tauri release binary & bundle...");
 execSync("npx tauri build", { cwd: rootDir, stdio: "inherit" });
 
 // 3. Extract standalone single EXE to clean output folder
-console.log("\n[3/3] Exporting standalone single EXE to ./release-exe/ ...");
+console.log("\n[3/4] Exporting standalone single EXE to ./release-exe/ ...");
 
 const releaseDir = path.join(rootDir, "src-tauri", "target", "release");
 const nsisDir = path.join(releaseDir, "bundle", "nsis");
+const exportedFiles = [];
 
 // Direct standalone single executable
 const directExe = path.join(releaseDir, "fininsight-tally-agent.exe");
@@ -38,6 +39,15 @@ if (fs.existsSync(directExe)) {
   fs.copyFileSync(directExe, destPath);
   const sizeMb = (fs.statSync(destPath).size / (1024 * 1024)).toFixed(2);
   console.log(` ✅ Standalone One-File EXE: ./release-exe/fininsight-tally-agent.exe (${sizeMb} MB)`);
+  exportedFiles.push(destPath);
+}
+
+// Copy WebView2Loader.dll if present (required for GNU toolchain / dynamic loader builds)
+const webView2Dll = path.join(releaseDir, "WebView2Loader.dll");
+if (fs.existsSync(webView2Dll)) {
+  const destDll = path.join(outDir, "WebView2Loader.dll");
+  fs.copyFileSync(webView2Dll, destDll);
+  console.log(` ✅ Copied WebView2Loader.dll to ./release-exe/WebView2Loader.dll`);
 }
 
 // NSIS Single-File Installer if present
@@ -49,8 +59,32 @@ if (fs.existsSync(nsisDir)) {
     fs.copyFileSync(src, dest);
     const sizeMb = (fs.statSync(dest).size / (1024 * 1024)).toFixed(2);
     console.log(` ✅ NSIS Setup One-File EXE: ./release-exe/${file} (${sizeMb} MB)`);
+    exportedFiles.push(dest);
   }
 }
 
-console.log("\n✨ Done! Your 1-file standalone production executable is ready in:");
+// 4. Digital Authenticode Signing Step
+console.log("\n[4/4] Authenticode Digital Code Signing Check...");
+const thumbprint = process.env.CERT_THUMBPRINT || process.env.TAURI_SIGNING_THUMBPRINT;
+const timestampUrl = process.env.TIMESTAMP_SERVER || "http://timestamp.digicert.com";
+
+if (thumbprint) {
+  console.log(` 🔏 Signing release executables with thumbprint: ${thumbprint}...`);
+  for (const filePath of exportedFiles) {
+    try {
+      execSync(
+        `signtool sign /sha1 "${thumbprint}" /tr "${timestampUrl}" /td sha256 /fd sha256 "${filePath}"`,
+        { stdio: "inherit" }
+      );
+      console.log(`    ✓ Signed: ${path.basename(filePath)}`);
+    } catch (signErr) {
+      console.error(`    ⚠️ Failed to sign ${path.basename(filePath)} with signtool:`, signErr.message);
+    }
+  }
+} else {
+  console.log(" ℹ️  No CERT_THUMBPRINT environment variable provided. Executables left unsigned.");
+  console.log("    To eliminate Windows SmartScreen warnings in production, set $env:CERT_THUMBPRINT=\"<THUMBPRINT>\"");
+}
+
+console.log("\n✨ Done! Your production executable is ready in:");
 console.log(`   📂 ${outDir}\n`);
