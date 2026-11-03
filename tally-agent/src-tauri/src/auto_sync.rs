@@ -191,15 +191,14 @@ async fn trigger_reminder(
 ) {
     let settings = state.settings_store.load().unwrap_or_default();
 
-    // Store in runtime state
-    state.set_sync_reminder(reminder.clone()).await;
-
-    // Check snooze
+    // Check snooze before updating state or alerting frontend
     if state.settings_store.is_snoozed(&settings) {
-        log::debug!("[auto_sync] Reminder is currently snoozed. Suppressing window popup.");
-        let _ = app_handle.emit("sync-reminder-changed", ());
+        log::debug!("[auto_sync] Reminder is currently snoozed. Suppressing window popup and event.");
         return;
     }
+
+    // Store in runtime state
+    state.set_sync_reminder(reminder.clone()).await;
 
     // Bring window to front so user sees the reminder
     if let Some(w) = app_handle.get_webview_window("main") {

@@ -980,6 +980,10 @@ impl AgentState {
     }
 
     pub async fn get_sync_reminder(&self) -> SyncReminderState {
+        let settings = self.settings_store.load().unwrap_or_default();
+        if self.settings_store.is_snoozed(&settings) {
+            return SyncReminderState::default();
+        }
         self.sync_reminder.read().await.clone()
     }
 

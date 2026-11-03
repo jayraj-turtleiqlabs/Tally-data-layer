@@ -119,7 +119,9 @@ async function loadSettings() {
   try {
     currentSettings = await invoke<AppSettings>("get_app_settings");
     autostartToggle.checked = currentSettings.autostart_enabled;
-    autoSyncIntervalSelect.value = String(currentSettings.auto_sync_interval_mins);
+    autoSyncIntervalSelect.value = currentSettings.auto_sync_enabled
+      ? String(currentSettings.auto_sync_interval_mins)
+      : "0";
   } catch (err) {
     console.error("Failed to load settings:", err);
   }
@@ -213,7 +215,6 @@ async function checkSyncReminder() {
   }
 }
 
-reminderDismiss:
 reminderSnoozeBtn.addEventListener("click", async () => {
   try {
     await invoke("dismiss_sync_reminder", { snoozeMinutes: 15 });
@@ -225,6 +226,13 @@ reminderSnoozeBtn.addEventListener("click", async () => {
 });
 
 reminderSyncNowBtn.addEventListener("click", async () => {
+  // Verify Tally is reachable first
+  const isReachable = await invoke<boolean>("check_tally_status");
+  if (!isReachable) {
+    openTallyOfflineModal();
+    return;
+  }
+
   reminderSyncNowBtn.disabled = true;
   reminderSyncNowBtn.textContent = "Syncing…";
 
