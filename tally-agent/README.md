@@ -1,6 +1,6 @@
 # FinInsight Tally Agent
 
-Windows desktop system-tray agent that bridges a locally installed **Tally ERP 9 / TallyPrime** instance to the FinInsight cloud backend. The agent runs in the background, pulls financial data **only when explicitly triggered**, and never exposes Tally data outside the paired FinInsight organization.
+Windows desktop system-tray agent that bridges a locally installed **Tally ERP 9 / TallyPrime** instance to the FinInsight cloud backend. The agent runs in the background, pulls financial data according to user preferences or on demand, and never exposes Tally data outside the paired FinInsight organization.
 
 ## Security Guarantees
 
@@ -15,7 +15,7 @@ Windows desktop system-tray agent that bridges a locally installed **Tally ERP 9
 | Checkpoint on ack only | `CheckpointStore::advance_on_ack()` called only after HTTP 200 |
 | Build-time API URL | `FININSIGHT_API_BASE` env var at compile time |
 | Redacted logs | `redact.rs` strips tokens, XML bodies, balances, names |
-| Code signing | `tauri.conf.json` → `certificateThumbprint` placeholder |
+| Code signing | `tauri.conf.json` & `scripts/build-exe.js` → Authenticode thumbprint |
 
 ## Prerequisites
 
@@ -54,9 +54,10 @@ Set before building:
 
 ```powershell
 $env:TAURI_SIGNING_CERTIFICATE_THUMBPRINT = "YOUR_CERT_THUMBPRINT"
+$env:CERT_THUMBPRINT = "YOUR_CERT_THUMBPRINT"
 ```
 
-> **Do not distribute unsigned binaries.** Use `cargo tauri build` only with a valid signing certificate for release.
+> **Do not distribute unsigned binaries.** Use `cargo tauri build` or `npm run build:exe` only with a valid signing certificate for release.
 
 ## Development
 
@@ -73,27 +74,37 @@ cd ..
 npm run tauri dev
 ```
 
-## Build Order (as implemented)
+## Features & Implementation
 
 1. `tally_client.rs` + `tally_envelope.rs` + `tally_schema.rs` — Export-only Tally XML
 2. `vault.rs` — OS credential vault
 3. `cloud_client.rs` — device auth, sync push, heartbeat
 4. Initial backfill (automatic post-pairing, batched)
-5. On-demand sync (tray "Sync Now" button — **no background sync timer**)
+5. On-demand sync (tray "Sync Now" button)
 6. Heartbeat loop (45s interval, decoupled from sync)
 7. Tray UI + status window
 8. Redacted logging
 9. Signing + updater config scaffolding
+10. Auto-start on boot via Windows Registry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
+11. App settings persistence (`settings.json`) & background auto-sync engine
+12. Tally offline modal reminders on startup & sync
+13. Auto-sync failure & missed sync interactive pop-up reminders ("Sync Now" / "Remind Me Later")
 
 ## Project Structure
 
 ```
 tally-agent/
 ├── src/                    # Tray UI (Vite + TypeScript)
+│   ├── index.html          # UI with preferences & interactive reminder modals
+│   ├── main.ts             # Event listeners & state management
+│   └── styles.css          # Theme, preferences dropdown, & modal dialog styles
 ├── src-tauri/
 │   ├── src/
-│   │   ├── main.rs         # Entry, tray, Tauri commands
-│   │   ├── lib.rs          # Agent state, heartbeat loop
+│   │   ├── main.rs         # Entry, tray, Tauri commands, startup reachability
+│   │   ├── lib.rs          # Agent state, heartbeat & sync reminder states
+│   │   ├── settings.rs     # App settings persistence (autostart, interval, snooze)
+│   │   ├── autostart.rs    # Windows Registry auto-start manager
+│   │   ├── auto_sync.rs    # Periodic background auto-sync runner & reminder alerts
 │   │   ├── tally_client.rs # Local Tally XML (Export-only)
 │   │   ├── tally_envelope.rs # Type-level Export-only envelopes
 │   │   ├── tally_schema.rs # ERP9 vs TallyPrime adapter
@@ -106,6 +117,8 @@ tally-agent/
 │   │   └── errors.rs       # Typed error enums
 │   ├── tests/fixtures/     # XML fixtures for unit tests
 │   └── tauri.conf.json     # Signing + updater scaffolding
+├── scripts/
+│   └── build-exe.js        # Packaging & Authenticode code signing script
 └── README.md
 ```
 
@@ -119,11 +132,20 @@ tally-agent/
 | POST | `/api/v1/agent/heartbeat` | Liveness, sliding token extension & sync_requested poll |
 | POST | `/api/v1/agent/revoke` | Revoke agent connection |
 
-## Sync Model
+## Sync & Automation Model
 
-- **No automatic background sync.** The agent stays idle until the user clicks **Sync Now** (tray menu or status window).
-- Dashboard-triggered sync is supported via the `sync_requested` flag returned on heartbeat (agent polls every ~45s).
-- Heartbeat reports Tally reachability only — it does not pull or push financial data.
+- **Background Auto-Sync**: The agent includes an integrated auto-sync background worker configured per user preferences.
+- **Interval Options**: Configurable (every 15m, 30m, 1h, 2h, 4h, 8h, or disabled) directly from the UI Preferences dropdown.
+- **Tally Offline Pop-Up**: If Tally is detected as offline upon agent startup (or when initiating sync), an interactive modal reminds the user to open Tally first with a 1-click "Check Again" button.
+- **Sync Failure & Omission Reminders**: If a scheduled auto-sync cannot complete (e.g. Tally closed or network error), the agent surfaces a persistent reminder modal offering "Sync Now" or "Remind Me Later" (snooze).
+- **Heartbeat vs Sync**: Heartbeat continues to report reachability every ~45s without pulling financial data.
+
+## Code Signing & SmartScreen Protection
+
+To prevent Windows SmartScreen "Unknown Publisher" / "Windows protected your PC" warnings when distributing the agent, refer to the detailed guide in [`docs/temp/temp.md`](../docs/temp/temp.md), covering:
+1. Microsoft Store submission flow (automatic trust, no code signing cert required).
+2. Direct Web Distribution using Azure Trusted Signing or EV Code Signing certificates.
+3. Automated Authenticode signing in `scripts/build-exe.js`.
 
 ## TODO
 

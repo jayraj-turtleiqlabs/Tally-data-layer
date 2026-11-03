@@ -127,3 +127,53 @@ This checklist guides manual verification of the Tally Agent (`tally-agent`) and
   [DEBUG] POST /api/v1/agent/revoke -> HTTP 200
   [INFO] Cleared credentials and checkpoint profile for connection_id='conn-...'
   ```
+
+---
+
+### Step 7: Auto-Start on Boot & Preferences Verification
+
+1. In the Agent UI header, click the **Settings / Gear icon** to open Preferences.
+2. Toggle **Start automatically on Windows boot** ON.
+3. Open Windows Registry Editor (`regedit`) and check key:
+   `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+   - Look for value: `FinInsightTallyAgent`.
+   - Verify value data contains: `"...tally-agent.exe" --autostart`.
+4. Toggle **Start automatically on Windows boot** OFF.
+   - Verify key value `FinInsightTallyAgent` is cleanly removed.
+5. Inspect `%LOCALAPPDATA%\FinInsight\TallyAgent\settings.json`:
+   - Verify `autostart_enabled` mirrors the UI toggle.
+
+---
+
+### Step 8: Tally Offline Modal Reminder (Startup & Pre-Sync)
+
+1. Exit Tally ERP 9 / TallyPrime completely (or terminate port 9000 listener).
+2. Launch or restart `tally-agent`.
+3. Within 3-5 seconds of startup, observe the Agent UI.
+
+- **Expected UI State**:
+  - Modal pops up: **"Tally is Not Running"**.
+  - Modal explains that Tally must be open with ODBC server enabled on port 9000.
+4. Click **Dismiss**: Modal closes, agent stays in idle state.
+5. In idle state with Tally closed, click **Sync Now**:
+  - Modal pops up immediately: **"Tally is Not Running"** (preventing redundant failed network requests).
+6. Start Tally and open your company.
+7. Click **Check Again**:
+  - The modal detects Tally is running, dismisses itself automatically, and displays a success notification.
+
+---
+
+### Step 9: Automatic Background Sync & Failure Reminder Pop-up
+
+1. In the Agent UI Preferences, set **Auto-Sync Interval** to `Every 15 minutes` (or set a fast test interval in `settings.json`).
+2. Keep Tally open and active. Wait for the interval period or trigger background timer.
+   - **Expected**: Background auto-sync executes silently and updates "Last Sync" timestamp.
+3. **Simulate Missed Sync**:
+   - Close Tally so the background auto-sync worker fails.
+   - Wait for background worker execution.
+- **Expected UI State**:
+  - Modal pops up: **"Data Sync Overdue / Sync Needed"**.
+  - Modal alerts: "Auto-sync could not complete because Tally is unreachable or closed."
+  - Offers **Sync Now** button and **Remind Me Later (30m)** button.
+4. Click **Remind Me Later**: Modal snoozes until the snooze expiration.
+5. Open Tally and click **Sync Now**: Delta sync executes immediately and clears the reminder alert.
