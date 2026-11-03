@@ -42,6 +42,14 @@ if (fs.existsSync(directExe)) {
   exportedFiles.push(destPath);
 }
 
+// Copy WebView2Loader.dll if present (required for GNU toolchain / dynamic loader builds)
+const webView2Dll = path.join(releaseDir, "WebView2Loader.dll");
+if (fs.existsSync(webView2Dll)) {
+  const destDll = path.join(outDir, "WebView2Loader.dll");
+  fs.copyFileSync(webView2Dll, destDll);
+  console.log(` ✅ Copied WebView2Loader.dll to ./release-exe/WebView2Loader.dll`);
+}
+
 // NSIS Single-File Installer if present
 if (fs.existsSync(nsisDir)) {
   const files = fs.readdirSync(nsisDir).filter((f) => f.endsWith(".exe"));
