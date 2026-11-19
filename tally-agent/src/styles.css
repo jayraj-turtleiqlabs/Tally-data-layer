@@ -37,10 +37,54 @@ header {
   margin-bottom: 20px;
 }
 
+.brand-container {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.header-brand-logo {
+  height: 24px;
+  width: auto;
+  max-width: 130px;
+  object-fit: contain;
+  border-radius: 4px;
+  background: white;
+  padding: 2px 6px;
+}
+
+.header-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 header h1 {
-  font-size: 1.1rem;
+  font-size: 1.05rem;
   font-weight: 600;
   margin: 0;
+}
+
+.modal-brand-icon {
+  width: 44px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: 10px;
+  margin: 0 auto 12px auto;
+  display: block;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.modal-brand-logo {
+  height: 32px;
+  width: auto;
+  max-width: 160px;
+  object-fit: contain;
+  margin: 0 auto 14px auto;
+  display: block;
+  border-radius: 6px;
+  background: white;
+  padding: 3px 8px;
 }
 
 .badge {

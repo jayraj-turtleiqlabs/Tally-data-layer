@@ -9,8 +9,8 @@ export function DashboardPage() {
   return (
     <div className="dashboard">
       <header className="dashboard-header">
-        <div>
-          <h1>FinInsight Dashboard</h1>
+        <div className="dashboard-brand-section">
+          <img src="/veebooks-logo-full.jpeg" alt="VeeBooks" className="dashboard-logo" />
           <p className="user-info">
             {user?.email} · {user?.role}
           </p>

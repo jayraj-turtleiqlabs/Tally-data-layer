@@ -3,15 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>FinInsight Tally Agent</title>
+    <title>VeeBooks - Tally Connector Agent</title>
+    <link rel="icon" type="image/png" href="/veebooks-app-icon-square.png" />
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
     <div id="app">
       <header>
-        <div>
-          <h1>FinInsight Tally Agent</h1>
-          <span id="tally-status-badge" class="badge badge-idle">Checking Tally…</span>
+        <div class="brand-container">
+          <img src="/veebooks-logo-full.jpeg" alt="VeeBooks" class="header-brand-logo" />
+          <div class="header-title-row">
+            <h1>Tally Agent</h1>
+            <span id="tally-status-badge" class="badge badge-idle">Checking Tally…</span>
+          </div>
         </div>
         <div class="header-actions">
           <button id="settings-toggle-btn" class="btn-icon-action" title="Preferences">
@@ -64,15 +68,9 @@
       <!-- Tally Offline Modal -->
       <section id="tally-offline-modal" class="card modal hidden">
         <div class="modal-content">
-          <div class="modal-badge-icon warning-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path>
-              <line x1="12" y1="9" x2="12" y2="13"></line>
-              <line x1="12" y1="17" x2="12.01" y2="17"></line>
-            </svg>
-          </div>
+          <img src="/veebooks-app-icon-square.png" alt="VeeBooks" class="modal-brand-icon" />
           <h2>Tally is Not Open</h2>
-          <p class="hint">FinInsight cannot connect to Tally on port 9000.</p>
+          <p class="hint">Cannot connect to Tally on port 9000.</p>
           
           <div class="instructions-card">
             <div class="instruction-item">
@@ -129,6 +127,7 @@
       <!-- Connection / Device Login Modal -->
       <section id="auth-modal" class="card modal hidden">
         <div class="modal-content">
+          <img src="/veebooks-logo-full.jpeg" alt="VeeBooks" class="modal-brand-logo" />
           <h2 id="auth-modal-title">Connect Company</h2>
           <p class="hint">Approve this connection in your browser window.</p>
           
@@ -144,7 +143,7 @@
 
           <div id="browser-fallback-container" class="fallback-container">
             <p class="fallback-hint">Browser didn't open automatically?</p>
-            <a id="browser-auth-link" class="fallback-link" href="#" target="_blank">Open FinInsight Approval Page ↗</a>
+            <a id="browser-auth-link" class="fallback-link" href="#" target="_blank">Open VeeBooks Approval Page ↗</a>
           </div>
 
           <p id="browser-auth-error" class="error hidden"></p>

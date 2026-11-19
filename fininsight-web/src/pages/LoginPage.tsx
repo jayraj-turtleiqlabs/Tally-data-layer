@@ -33,7 +33,9 @@ export function LoginPage() {
   return (
     <div className="login-page">
       <form className="login-card" onSubmit={handleSubmit}>
-        <h1>FinInsight</h1>
+        <div className="login-brand">
+          <img src="/veebooks-logo-full.jpeg" alt="VeeBooks" className="login-logo" />
+        </div>
         <p className="subtitle">Sign in to your account</p>
 
         <label htmlFor="email">Email</label>
